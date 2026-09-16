@@ -1,1 +1,1 @@
-# Finorix AI live feed uses Python's standard library; no pip packages are required.
+# No external packages required
