@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Finorix AI</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#090d12;color:#eaf0f5;font-family:Inter,system-ui,-apple-system,sans-serif}button,select{font:inherit}.app{max-width:1100px;margin:auto;padding:12px}.top{display:flex;align-items:center;justify-content:space-between;padding:8px 2px 14px}.brand{font-weight:900;letter-spacing:.5px}.brand span{color:#21d36b}.status{font-size:12px;color:#6ee89a}.toolbar{display:flex;gap:8px;flex-wrap:wrap}.toolbar select,.toolbar button{background:#121923;color:#eaf0f5;border:1px solid #263140;border-radius:10px;padding:9px 12px}.grid{display:grid;grid-template-columns:1.65fr .85fr;gap:12px}.card{background:#0e141c;border:1px solid #1e2935;border-radius:16px;overflow:hidden;box-shadow:0 10px 30px #0005}.chart{height:520px;position:relative}.chart canvas{width:100%;height:100%;display:block}.price{position:absolute;right:10px;top:50%;background:#1e9bf3;padding:5px 8px;border-radius:7px;font-size:12px}.line{position:absolute;left:0;right:60px;top:50%;border-top:1px dashed #56a7d9}.panel{padding:16px}.signal{font-size:38px;font-weight:900;margin:4px 0}.up{color:#31d66b}.down{color:#ff5b52}.wait{color:#e8c95a}.confidence{height:9px;background:#202b37;border-radius:9px;overflow:hidden;margin:12px 0}.confidence i{display:block;height:100%;width:0;background:#31d66b}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px}.meta div{background:#121a24;border-radius:10px;padding:10px}.label{font-size:11px;color:#82909e}.value{font-weight:800;margin-top:3px}.reasons{margin:14px 0 0;padding:0;list-style:none}.reasons li{padding:8px 0;border-bottom:1px solid #1d2630;font-size:13px}.history{margin-top:12px}.history table{width:100%;border-collapse:collapse;font-size:13px}.history th,.history td{text-align:left;padding:10px;border-bottom:1px solid #1c2631}.badge{padding:4px 7px;border-radius:7px;background:#18232e}.footer{padding:12px;text-align:center;color:#64717e;font-size:11px}.pulse{animation:pulse 1.2s infinite}@keyframes pulse{50%{opacity:.45}}@media(max-width:780px){.grid{grid-template-columns:1fr}.chart{height:390px}.signal{font-size:32px}}
+</style>
+</head>
+<body><main class="app">
+<header class="top"><div class="brand">✦ FINORIX <span>AI</span></div><div class="status"><b class="pulse">● LIVE</b> &nbsp; prototype engine</div></header>
+<div class="toolbar"><select id="pair"><option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option><option>USD/BDT (OTC)</option></select><select id="tf"><option>1M</option><option>5M</option></select><button id="analyze">Analyze closed candle</button></div>
+<section class="grid"><div class="card chart"><canvas id="chart"></canvas><div class="line"></div><div class="price" id="price">—</div></div>
+<aside class="card panel"><div class="label">NEXT CANDLE</div><div id="signal" class="signal wait">WAIT</div><div id="confidenceText">Confidence 50%</div><div class="confidence"><i id="bar"></i></div><div class="meta"><div><div class="label">PAIR</div><div class="value" id="pairText">EUR/USD</div></div><div><div class="label">TIMEFRAME</div><div class="value">1 MIN</div></div><div><div class="label">ACTION</div><div class="value" id="action">WAIT</div></div><div><div class="label">MODE</div><div class="value">CLOSED-CANDLE</div></div></div><ul id="reasons" class="reasons"><li>Waiting for analysis…</li></ul></aside></section>
+<section class="card panel history"><div class="label">SIGNAL HISTORY</div><table><thead><tr><th>Time</th><th>Pair</th><th>Prediction</th><th>Confidence</th><th>Result</th></tr></thead><tbody id="history"></tbody></table></section>
+<div class="footer">Prototype only. Predictions are probabilistic and not guaranteed. Use historical testing before any real-money trading.</div>
+</main>
+<script>
+const canvas=document.getElementById('chart'),ctx=canvas.getContext('2d');
+let candles=[],history=[],lastAnalyzedClosed='';
+const pairEl=document.getElementById('pair'),tfEl=document.getElementById('tf');
+function interval(){return tfEl.value==='5M'?'5min':'1min'}
+function draw(){
+  if(!candles.length)return;
+  let d=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=w*d;canvas.height=h*d;ctx.setTransform(d,0,0,d,0,0);ctx.clearRect(0,0,w,h);
+  let lo=Math.min(...candles.map(x=>x.low)),hi=Math.max(...candles.map(x=>x.high)),pad=25;const span=Math.max(hi-lo,1e-9),y=v=>h-pad-(v-lo)/span*(h-pad*2),cw=Math.max(5,w/candles.length*.62);
+  candles.forEach((c,i)=>{let x=12+i*(w-24)/candles.length,yy=y(c.close),yo=y(c.open);ctx.strokeStyle='#6f7c88';ctx.beginPath();ctx.moveTo(x,y(c.low));ctx.lineTo(x,y(c.high));ctx.stroke();ctx.fillStyle=c.close>=c.open?'#22d36a':'#ff554d';ctx.fillRect(x-cw/2,Math.min(yo,yy),cw,Math.max(2,Math.abs(yy-yo)));});
+  document.getElementById('price').textContent=candles.at(-1).close.toFixed(5);
+}
+function renderPrediction(x){
+  let s=document.getElementById('signal');s.textContent=x.direction;s.className='signal '+(x.direction==='UP'?'up':x.direction==='DOWN'?'down':'wait');
+  document.getElementById('confidenceText').textContent='Confidence '+x.confidence+'%';document.getElementById('bar').style.width=x.confidence+'%';
+  document.getElementById('pairText').textContent=pairEl.value;document.getElementById('action').textContent=x.direction==='UP'?'BUY':x.direction==='DOWN'?'SELL':'WAIT';
+  document.getElementById('reasons').innerHTML=x.reasons.map(v=>'<li>✓ '+v+'</li>').join('');
+}
+function addHistory(x,stamp){
+  history.unshift({time:new Date(stamp.replace(' ','T')+'Z').toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),pair:pairEl.value,p:x.direction,c:x.confidence,result:'Pending'});history=history.slice(0,8);
+  document.getElementById('history').innerHTML=history.map(v=>`<tr><td>${v.time}</td><td>${v.pair}</td><td><span class="badge">${v.p}</span></td><td>${v.c}%</td><td>${v.result}</td></tr>`).join('');
+}
+async function refresh(force=false){
+  const status=document.querySelector('.status');
+  try{
+    const r=await fetch('/api/candles?symbol='+encodeURIComponent(pairEl.value)+'&interval='+interval(),{cache:'no-store'});const x=await r.json();if(!r.ok)throw new Error(x.error||'Feed unavailable');
+    candles=x.candles;draw();status.innerHTML='<b class="pulse">● LIVE</b> &nbsp; '+x.source;
+    renderPrediction(x.prediction);
+    if(force||x.last_closed_timestamp!==lastAnalyzedClosed){lastAnalyzedClosed=x.last_closed_timestamp;if(!force)addHistory(x.prediction,x.last_closed_timestamp);}
+  }catch(e){status.innerHTML='<b style="color:#ff6b62">● FEED ERROR</b> &nbsp; '+e.message;}
+}
+window.addEventListener('resize',draw);pairEl.onchange=()=>{lastAnalyzedClosed='';refresh(true)};tfEl.onchange=()=>{lastAnalyzedClosed='';refresh(true)};refresh(true);setInterval(()=>refresh(false),15000);
+</script></body></html>
