@@ -1,40 +1,38 @@
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-
-from pathlib import Path
-
-from urllib.parse import urlparse, parse_qs
-
-from urllib.request import Request, urlopen
-
-from urllib.error import HTTPError, URLError
-
-from datetime import datetime, timezone
+import os
 
 import json
 
-import os
-
 import time
 
-from engine import predict_next_candle
+import math
 
-ROOT = Path(__file__).parent
+import threading
 
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+import urllib.parse
 
-# Live candle refresh
+import urllib.request
 
-CACHE_TTL_SECONDS = 5
+from datetime import datetime, timezone
 
-ALLOWED_INTERVALS = {
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    "1min": "1min",
+import websocket
 
-    "5min": "5min",
+# ============================================================
 
-}
+# FINORIX AI — LIVE CURRENT CANDLE
 
-ALLOWED_SYMBOLS = {
+# ============================================================
+
+API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+
+HOST = "0.0.0.0"
+
+PORT = int(os.getenv("PORT", "10000"))
+
+WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
+
+REAL_SYMBOLS = [
 
     "EUR/USD",
 
@@ -52,482 +50,1706 @@ ALLOWED_SYMBOLS = {
 
     "EUR/GBP",
 
+]
+
+DEFAULT_SYMBOL = "EUR/USD"
+
+state_lock = threading.Lock()
+
+state = {
+
+    "symbol": DEFAULT_SYMBOL,
+
+    "price": None,
+
+    "current": None,
+
+    "previous": None,
+
+    "history": [],
+
+    "prediction": None,
+
+    "ws_connected": False,
+
+    "last_tick": None,
+
+    "error": None,
+
 }
 
-_cache = {}
+# ============================================================
 
-def normalize_time_series(payload):
+# TIME
 
-    values = payload.get("values") or []
+# ============================================================
 
-    candles = []
+def now_utc():
 
-    for row in values:
+    return datetime.now(timezone.utc)
 
-        try:
+def minute_start(ts):
 
-            candles.append({
+    return ts - (ts % 60)
 
-                "timestamp": str(row["datetime"]),
+def format_time_utc6(ts):
 
-                "open": float(row["open"]),
+    if ts is None:
 
-                "high": float(row["high"]),
+        return "--"
 
-                "low": float(row["low"]),
+    dt = datetime.fromtimestamp(ts, timezone.utc)
 
-                "close": float(row["close"]),
+    # Bangladesh UTC+6 display
 
-                "volume": float(row.get("volume", 0) or 0),
+    from datetime import timedelta
 
-            })
+    dt = dt + timedelta(hours=6)
 
-        except (KeyError, TypeError, ValueError):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-            continue
+def format_time_utc(ts):
 
-    candles.sort(key=lambda x: x["timestamp"])
+    if ts is None:
 
-    return candles
+        return "--"
 
-def fetch_candles(symbol, interval):
+    dt = datetime.fromtimestamp(ts, timezone.utc)
 
-    api_key = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    if not api_key:
+# ============================================================
 
-        raise RuntimeError("TWELVE_DATA_API_KEY is not configured")
+# TWELVE DATA REST
 
-    cache_key = (symbol, interval)
+# Used only for historical/previous candle + EMA context.
 
-    now = time.monotonic()
+# Current candle comes from WebSocket ticks.
 
-    cached = _cache.get(cache_key)
+# ============================================================
 
-    if cached and now - cached["at"] < CACHE_TTL_SECONDS:
+def fetch_history(symbol):
 
-        return cached["data"]
+    if not API_KEY:
 
-    query = (
+        return []
 
-        f"symbol={symbol}"
+    params = urllib.parse.urlencode({
 
-        f"&interval={interval}"
+        "symbol": symbol,
 
-        f"&outputsize=120"
+        "interval": "1min",
 
-        f"&timezone=UTC"
+        "outputsize": 120,
 
-        f"&apikey={api_key}"
+        "timezone": "UTC",
 
-    )
+        "apikey": API_KEY,
 
-    req = Request(
+    })
 
-        f"{TWELVE_DATA_URL}?{query}",
-
-        headers={"User-Agent": "FinorixAI/1.0"}
-
-    )
+    url = "https://api.twelvedata.com/time_series?" + params
 
     try:
 
-        with urlopen(req, timeout=10) as response:
+        req = urllib.request.Request(
 
-            payload = json.loads(
+            url,
 
-                response.read().decode("utf-8")
-
-            )
-
-    except HTTPError as exc:
-
-        raise RuntimeError(
-
-            f"Market data provider HTTP {exc.code}"
-
-        ) from exc
-
-    except URLError as exc:
-
-        raise RuntimeError(
-
-            "Market data provider connection failed"
-
-        ) from exc
-
-    if payload.get("status") == "error" or "values" not in payload:
-
-        raise RuntimeError(
-
-            payload.get(
-
-                "message",
-
-                "Market data provider returned no candle data"
-
-            )
+            headers={"User-Agent": "FinorixAI/1.0"}
 
         )
 
-    candles = normalize_time_series(payload)
+        with urllib.request.urlopen(req, timeout=15) as response:
 
-    if not candles:
+            data = json.loads(response.read().decode("utf-8"))
 
-        raise RuntimeError(
+        if data.get("status") == "error":
 
-            "Market data provider returned an empty candle set"
+            raise RuntimeError(data.get("message", "Twelve Data error"))
 
-        )
+        rows = data.get("values", [])
 
-    _cache[cache_key] = {
+        candles = []
 
-        "at": now,
-
-        "data": candles
-
-    }
-
-    return candles
-
-def json_response(handler, status, payload):
-
-    body = json.dumps(
-
-        payload,
-
-        separators=(",", ":")
-
-    ).encode()
-
-    handler.send_response(status)
-
-    handler.send_header(
-
-        "Content-Type",
-
-        "application/json; charset=utf-8"
-
-    )
-
-    handler.send_header(
-
-        "Cache-Control",
-
-        "no-store"
-
-    )
-
-    handler.send_header(
-
-        "Content-Length",
-
-        str(len(body))
-
-    )
-
-    handler.end_headers()
-
-    handler.wfile.write(body)
-
-class Handler(SimpleHTTPRequestHandler):
-
-    def do_POST(self):
-
-        if self.path != "/api/predict":
-
-            self.send_error(404)
-
-            return
-
-        try:
-
-            length = int(
-
-                self.headers.get(
-
-                    "Content-Length",
-
-                    "0"
-
-                )
-
-            )
-
-            payload = json.loads(
-
-                self.rfile.read(length)
-
-            )
-
-            result = predict_next_candle(
-
-                payload.get("candles", [])
-
-            )
-
-            json_response(
-
-                self,
-
-                200,
-
-                result
-
-            )
-
-        except Exception as exc:
-
-            json_response(
-
-                self,
-
-                400,
-
-                {"error": str(exc)}
-
-            )
-
-    def do_GET(self):
-
-        parsed = urlparse(self.path)
-
-        # Health check
-
-        if parsed.path == "/api/health":
-
-            json_response(
-
-                self,
-
-                200,
-
-                {
-
-                    "status": "ok",
-
-                    "engine": "finorix-live",
-
-                    "market_data": (
-
-                        "configured"
-
-                        if os.environ.get(
-
-                            "TWELVE_DATA_API_KEY"
-
-                        )
-
-                        else "missing_api_key"
-
-                    ),
-
-                }
-
-            )
-
-            return
-
-        # Candle + prediction API
-
-        if parsed.path == "/api/candles":
+        for row in rows:
 
             try:
 
-                params = parse_qs(
+                dt = datetime.strptime(
 
-                    parsed.query
+                    row["datetime"],
 
-                )
+                    "%Y-%m-%d %H:%M:%S"
 
-                symbol = params.get(
+                ).replace(tzinfo=timezone.utc)
 
-                    "symbol",
+                candles.append({
 
-                    ["EUR/USD"]
+                    "timestamp": int(dt.timestamp()),
 
-                )[0].upper()
+                    "open": float(row["open"]),
 
-                interval = params.get(
+                    "high": float(row["high"]),
 
-                    "interval",
+                    "low": float(row["low"]),
 
-                    ["1min"]
+                    "close": float(row["close"]),
 
-                )[0]
+                })
 
-                if symbol not in ALLOWED_SYMBOLS:
+            except Exception:
 
-                    raise ValueError(
+                continue
 
-                        "Unsupported live symbol. "
+        candles.sort(key=lambda x: x["timestamp"])
 
-                        "OTC symbols are not available "
+        return candles
 
-                        "from this feed."
+    except Exception as e:
 
-                    )
+        with state_lock:
 
-                if interval not in ALLOWED_INTERVALS:
+            state["error"] = str(e)
 
-                    raise ValueError(
+        return []
 
-                        "Unsupported interval"
+# ============================================================
 
-                    )
+# EMA
 
-                # Get live market candles
+# ============================================================
 
-                candles = fetch_candles(
+def ema(values, period):
 
-                    symbol,
+    if not values:
 
-                    interval
+        return None
 
-                )
+    if len(values) < period:
 
-                if len(candles) < 3:
+        period = len(values)
 
-                    raise RuntimeError(
+    if period <= 0:
 
-                        "Waiting for enough candles"
+        return None
 
-                    )
+    multiplier = 2 / (period + 1)
 
-                # IMPORTANT:
+    result = sum(values[:period]) / period
 
-                # The latest candle is treated as the
+    for value in values[period:]:
 
-                # current/forming candle when the data
+        result = ((value - result) * multiplier) + result
 
-                # provider supplies it.
+    return result
 
-                current_candle = candles[-1]
+# ============================================================
 
-                # Previous candles
+# CANDLE HELPERS
 
-                closed_candles = candles[:-1]
+# ============================================================
 
-                # Prediction uses the CURRENT candle
+def candle_body(c):
 
-                # as the signal/input candle.
+    return abs(c["close"] - c["open"])
 
-                prediction = predict_next_candle(
+def candle_range(c):
 
-                    candles[-100:]
+    return max(c["high"] - c["low"], 1e-12)
 
-                )
+def candle_direction(c):
 
-                json_response(
+    if c["close"] > c["open"]:
 
-                    self,
+        return 1
 
-                    200,
+    if c["close"] < c["open"]:
 
-                    {
+        return -1
 
-                        "source": "Twelve Data",
+    return 0
 
-                        "symbol": symbol,
+def body_strength(c):
 
-                        "interval": interval,
+    return candle_body(c) / candle_range(c)
 
-                        "updated_at":
+def upper_wick(c):
 
-                            datetime.now(
+    return c["high"] - max(c["open"], c["close"])
 
-                                timezone.utc
+def lower_wick(c):
 
-                            ).isoformat(),
+    return min(c["open"], c["close"]) - c["low"]
 
-                        "candles":
+# ============================================================
 
-                            candles[-100:],
+# LIVE CANDLE CREATION
 
-                        "closed_candles":
+# ============================================================
 
-                            closed_candles[-100:],
+def create_live_candle(ts, price):
 
-                        "current_candle":
+    start = minute_start(ts)
 
-                            current_candle,
+    return {
 
-                        "current_candle_timestamp":
+        "timestamp": start,
 
-                            current_candle[
+        "open": price,
 
-                                "timestamp"
+        "high": price,
 
-                            ],
+        "low": price,
 
-                        "last_closed_timestamp":
+        "close": price,
 
-                            (
+    }
 
-                                closed_candles[-1][
+def update_live_candle(ts, price):
 
-                                    "timestamp"
+    with state_lock:
 
-                                ]
+        current = state["current"]
 
-                                if closed_candles
+        if current is None:
 
-                                else None
+            state["current"] = create_live_candle(ts, price)
 
-                            ),
+            state["price"] = price
 
-                        "prediction":
-
-                            prediction,
-
-                    }
-
-                )
-
-            except Exception as exc:
-
-                json_response(
-
-                    self,
-
-                    503,
-
-                    {"error": str(exc)}
-
-                )
+            state["last_tick"] = ts
 
             return
 
-        return super().do_GET()
+        current_start = current["timestamp"]
 
-if __name__ == "__main__":
+        incoming_start = minute_start(ts)
 
-    os.chdir(ROOT)
+        # New minute started
 
-    port = int(
+        if incoming_start > current_start:
 
-        os.environ.get(
+            state["previous"] = current.copy()
 
-            "PORT",
+            # Save completed candle
 
-            "8080"
+            state["history"].append(current.copy())
+
+            if len(state["history"]) > 150:
+
+                state["history"] = state["history"][-150:]
+
+            state["current"] = create_live_candle(ts, price)
+
+        # Ignore old tick
+
+        elif incoming_start < current_start:
+
+            return
+
+        else:
+
+            current["high"] = max(current["high"], price)
+
+            current["low"] = min(current["low"], price)
+
+            current["close"] = price
+
+        state["price"] = price
+
+        state["last_tick"] = ts
+
+# ============================================================
+
+# PREDICTION ENGINE
+
+# IMPORTANT:
+
+# Prediction is ALWAYS for the NEXT candle.
+
+# ============================================================
+
+def analyze_current(symbol):
+
+    with state_lock:
+
+        current = state["current"].copy() if state["current"] else None
+
+        previous = state["previous"].copy() if state["previous"] else None
+
+        history = list(state["history"])
+
+        price = state["price"]
+
+    if not current or price is None:
+
+        return {
+
+            "direction": "WAIT",
+
+            "confidence": 0,
+
+            "action": "WAIT",
+
+            "reason": "Waiting for live candle data."
+
+        }
+
+    # --------------------------------------------------------
+
+    # Build close history for EMA
+
+    # --------------------------------------------------------
+
+    closes = [x["close"] for x in history]
+
+    if previous:
+
+        closes.append(previous["close"])
+
+    closes.append(current["close"])
+
+    ema5 = ema(closes, 5)
+
+    ema10 = ema(closes, 10)
+
+    ema20 = ema(closes, 20)
+
+    # --------------------------------------------------------
+
+    # Current candle measurements
+
+    # --------------------------------------------------------
+
+    body = candle_body(current)
+
+    rng = candle_range(current)
+
+    body_strength_value = body / rng
+
+    uw = upper_wick(current)
+
+    lw = lower_wick(current)
+
+    position = (
+
+        (price - current["low"]) /
+
+        max(current["high"] - current["low"], 1e-12)
+
+    )
+
+    current_dir = candle_direction(current)
+
+    score = 0
+
+    reasons = []
+
+    # --------------------------------------------------------
+
+    # Current candle direction
+
+    # --------------------------------------------------------
+
+    if current_dir > 0:
+
+        score += 2
+
+        reasons.append("Current candle is bullish")
+
+    elif current_dir < 0:
+
+        score -= 2
+
+        reasons.append("Current candle is bearish")
+
+    # --------------------------------------------------------
+
+    # Body strength
+
+    # --------------------------------------------------------
+
+    if body_strength_value >= 0.60:
+
+        if current_dir > 0:
+
+            score += 1
+
+            reasons.append("Strong bullish body")
+
+        elif current_dir < 0:
+
+            score -= 1
+
+            reasons.append("Strong bearish body")
+
+    # --------------------------------------------------------
+
+    # Current price position
+
+    # --------------------------------------------------------
+
+    if position >= 0.75:
+
+        score += 1
+
+        reasons.append("Price is near current high")
+
+    elif position <= 0.25:
+
+        score -= 1
+
+        reasons.append("Price is near current low")
+
+    # --------------------------------------------------------
+
+    # Wick rejection
+
+    # --------------------------------------------------------
+
+    if uw > body * 1.2 and uw > lw:
+
+        score -= 1
+
+        reasons.append("Upper-wick rejection")
+
+    if lw > body * 1.2 and lw > uw:
+
+        score += 1
+
+        reasons.append("Lower-wick rejection")
+
+    # --------------------------------------------------------
+
+    # Previous candle
+
+    # --------------------------------------------------------
+
+    if previous:
+
+        prev_dir = candle_direction(previous)
+
+        if prev_dir > 0:
+
+            score += 1
+
+            reasons.append("Previous candle bullish")
+
+        elif prev_dir < 0:
+
+            score -= 1
+
+            reasons.append("Previous candle bearish")
+
+        # Break previous high
+
+        if price > previous["high"]:
+
+            score += 2
+
+            reasons.append("Live price broke previous high")
+
+        # Break previous low
+
+        elif price < previous["low"]:
+
+            score -= 2
+
+            reasons.append("Live price broke previous low")
+
+    # --------------------------------------------------------
+
+    # Short momentum
+
+    # --------------------------------------------------------
+
+    if len(closes) >= 4:
+
+        recent = closes[-4:]
+
+        up_count = sum(
+
+            1 for i in range(1, len(recent))
+
+            if recent[i] > recent[i - 1]
 
         )
+
+        down_count = sum(
+
+            1 for i in range(1, len(recent))
+
+            if recent[i] < recent[i - 1]
+
+        )
+
+        if up_count >= 2 and down_count == 0:
+
+            score += 2
+
+            reasons.append("Short momentum bullish")
+
+        elif down_count >= 2 and up_count == 0:
+
+            score -= 2
+
+            reasons.append("Short momentum bearish")
+
+    # --------------------------------------------------------
+
+    # EMA structure
+
+    # --------------------------------------------------------
+
+    if ema5 is not None and ema10 is not None:
+
+        if price > ema5 > ema10:
+
+            score += 2
+
+            reasons.append("Bullish EMA structure")
+
+        elif price < ema5 < ema10:
+
+            score -= 2
+
+            reasons.append("Bearish EMA structure")
+
+    # EMA20 extra context
+
+    if ema20 is not None:
+
+        if price > ema20:
+
+            score += 1
+
+            reasons.append("Price above EMA20")
+
+        elif price < ema20:
+
+            score -= 1
+
+            reasons.append("Price below EMA20")
+
+    # --------------------------------------------------------
+
+    # FINAL QUALITY FILTER
+
+    # --------------------------------------------------------
+
+    if score >= 7:
+
+        direction = "UP"
+
+    elif score <= -7:
+
+        direction = "DOWN"
+
+    else:
+
+        direction = "WAIT"
+
+    confidence = min(92, 50 + abs(score) * 5)
+
+    if direction == "WAIT":
+
+        confidence = min(confidence, 64)
+
+    action = {
+
+        "UP": "NEXT CANDLE BUY",
+
+        "DOWN": "NEXT CANDLE SELL",
+
+        "WAIT": "WAIT"
+
+    }[direction]
+
+    return {
+
+        "direction": direction,
+
+        "confidence": confidence,
+
+        "action": action,
+
+        "score": score,
+
+        "reasons": reasons[-8:],
+
+        "current": current,
+
+        "previous": previous,
+
+        "ema5": ema5,
+
+        "ema10": ema10,
+
+        "ema20": ema20,
+
+        "body_strength": round(body_strength_value, 4),
+
+        "price_position": round(position, 4),
+
+        "upper_wick": uw,
+
+        "lower_wick": lw,
+
+    }
+
+# ============================================================
+
+# WEBSOCKET
+
+# ============================================================
+
+def websocket_url():
+
+    return WS_URL + "?apikey=" + urllib.parse.quote(API_KEY)
+
+def subscribe(ws):
+
+    message = {
+
+        "action": "subscribe",
+
+        "params": {
+
+            "symbols": ",".join(REAL_SYMBOLS)
+
+        }
+
+    }
+
+    ws.send(json.dumps(message))
+
+def websocket_worker():
+
+    while True:
+
+        if not API_KEY:
+
+            with state_lock:
+
+                state["ws_connected"] = False
+
+                state["error"] = "TWELVE_DATA_API_KEY is missing."
+
+            time.sleep(10)
+
+            continue
+
+        try:
+
+            def on_open(ws):
+
+                with state_lock:
+
+                    state["ws_connected"] = True
+
+                    state["error"] = None
+
+                subscribe(ws)
+
+            def on_message(ws, message):
+
+                try:
+
+                    data = json.loads(message)
+
+                except Exception:
+
+                    return
+
+                if data.get("event") != "price":
+
+                    return
+
+                symbol = data.get("symbol")
+
+                price_value = data.get("price")
+
+                timestamp = data.get("timestamp")
+
+                if symbol not in REAL_SYMBOLS:
+
+                    return
+
+                try:
+
+                    price = float(price_value)
+
+                except Exception:
+
+                    return
+
+                try:
+
+                    ts = float(timestamp)
+
+                except Exception:
+
+                    ts = time.time()
+
+                # Only update currently selected symbol
+
+                with state_lock:
+
+                    selected = state["symbol"]
+
+                if symbol != selected:
+
+                    return
+
+                update_live_candle(ts, price)
+
+            def on_error(ws, error):
+
+                with state_lock:
+
+                    state["ws_connected"] = False
+
+                    state["error"] = str(error)
+
+            def on_close(ws, close_status_code, close_msg):
+
+                with state_lock:
+
+                    state["ws_connected"] = False
+
+            ws = websocket.WebSocketApp(
+
+                websocket_url(),
+
+                on_open=on_open,
+
+                on_message=on_message,
+
+                on_error=on_error,
+
+                on_close=on_close,
+
+            )
+
+            ws.run_forever(
+
+                ping_interval=20,
+
+                ping_timeout=10
+
+            )
+
+        except Exception as e:
+
+            with state_lock:
+
+                state["ws_connected"] = False
+
+                state["error"] = str(e)
+
+        time.sleep(5)
+
+# ============================================================
+
+# LOAD HISTORICAL DATA
+
+# ============================================================
+
+def load_symbol(symbol):
+
+    candles = fetch_history(symbol)
+
+    if not candles:
+
+        return
+
+    now_ts = time.time()
+
+    current_start = minute_start(now_ts)
+
+    previous = None
+
+    current_seed = None
+
+    history = []
+
+    for candle in candles:
+
+        if candle["timestamp"] < current_start:
+
+            history.append(candle)
+
+            if (
+
+                previous is None or
+
+                candle["timestamp"] > previous["timestamp"]
+
+            ):
+
+                previous = candle
+
+        elif candle["timestamp"] == current_start:
+
+            current_seed = candle
+
+    # Keep historical candles
+
+    history = history[-150:]
+
+    with state_lock:
+
+        state["symbol"] = symbol
+
+        state["history"] = history
+
+        state["previous"] = previous
+
+        # If REST already has current candle,
+
+        # use it only as initial seed until live ticks arrive.
+
+        if current_seed:
+
+            state["current"] = current_seed.copy()
+
+            state["price"] = current_seed["close"]
+
+        else:
+
+            state["current"] = None
+
+            state["price"] = None
+
+        state["prediction"] = None
+
+# ============================================================
+
+# API
+
+# ============================================================
+
+def api_response():
+
+    with state_lock:
+
+        symbol = state["symbol"]
+
+        current = state["current"].copy() if state["current"] else None
+
+        previous = state["previous"].copy() if state["previous"] else None
+
+        price = state["price"]
+
+        connected = state["ws_connected"]
+
+        last_tick = state["last_tick"]
+
+        error = state["error"]
+
+    prediction = analyze_current(symbol)
+
+    now_ts = time.time()
+
+    if current:
+
+        candle_end = current["timestamp"] + 60
+
+        remaining = max(0, int(candle_end - now_ts))
+
+    else:
+
+        candle_end = None
+
+        remaining = None
+
+    return {
+
+        "status": "ok",
+
+        "mode": "CURRENT-CANDLE LIVE",
+
+        "symbol": symbol,
+
+        "market": "REAL FOREX",
+
+        "time": {
+
+            "utc": format_time_utc(now_ts),
+
+            "utc6": format_time_utc6(now_ts),
+
+            "current_candle": (
+
+                format_time_utc6(current["timestamp"])
+
+                if current else "--"
+
+            ),
+
+            "candle_end": (
+
+                format_time_utc6(candle_end)
+
+                if candle_end else "--"
+
+            ),
+
+            "seconds_remaining": remaining,
+
+        },
+
+        "websocket": {
+
+            "connected": connected,
+
+            "last_tick": (
+
+                format_time_utc(last_tick)
+
+                if last_tick else "--"
+
+            ),
+
+        },
+
+        "current_candle": current,
+
+        "previous_candle": previous,
+
+        "price": price,
+
+        "prediction": prediction,
+
+        "error": error,
+
+    }
+
+# ============================================================
+
+# WEB PAGE
+
+# ============================================================
+
+HTML = r"""
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>FINORIX AI</title>
+
+<style>
+
+body {
+
+    margin: 0;
+
+    background: #07111f;
+
+    color: white;
+
+    font-family: Arial, sans-serif;
+
+}
+
+.container {
+
+    max-width: 650px;
+
+    margin: auto;
+
+    padding: 18px;
+
+}
+
+.card {
+
+    background: #0d1b2d;
+
+    border: 1px solid #20344e;
+
+    border-radius: 16px;
+
+    padding: 18px;
+
+    margin-bottom: 14px;
+
+}
+
+.title {
+
+    font-size: 28px;
+
+    font-weight: bold;
+
+}
+
+.mode {
+
+    margin-top: 7px;
+
+    color: #55d6ff;
+
+    font-weight: bold;
+
+}
+
+.row {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    padding: 8px 0;
+
+    border-bottom: 1px solid #1b2d43;
+
+}
+
+.big {
+
+    font-size: 42px;
+
+    font-weight: bold;
+
+    text-align: center;
+
+    margin: 18px 0;
+
+}
+
+.up {
+
+    color: #39e58c;
+
+}
+
+.down {
+
+    color: #ff6577;
+
+}
+
+.wait {
+
+    color: #ffc857;
+
+}
+
+button, select {
+
+    width: 100%;
+
+    padding: 13px;
+
+    border-radius: 10px;
+
+    border: 0;
+
+    margin-top: 8px;
+
+    font-size: 16px;
+
+}
+
+button {
+
+    background: #1d8cff;
+
+    color: white;
+
+    font-weight: bold;
+
+}
+
+.status {
+
+    text-align: center;
+
+    margin-top: 10px;
+
+}
+
+.reason {
+
+    margin: 7px 0;
+
+    padding: 9px;
+
+    background: #102238;
+
+    border-radius: 8px;
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+    <div class="card">
+
+        <div class="title">FINORIX AI</div>
+
+        <div class="mode">MODE: CURRENT-CANDLE LIVE</div>
+
+        <div>REAL FOREX MARKET — NO OTC</div>
+
+        <select id="symbol">
+
+            <option>EUR/USD</option>
+
+            <option>GBP/USD</option>
+
+            <option>USD/JPY</option>
+
+            <option>AUD/USD</option>
+
+            <option>USD/CAD</option>
+
+            <option>USD/CHF</option>
+
+            <option>NZD/USD</option>
+
+            <option>EUR/GBP</option>
+
+        </select>
+
+        <button onclick="changeSymbol()">CHANGE MARKET</button>
+
+    </div>
+
+    <div class="card">
+
+        <div class="row">
+
+            <span>Market</span>
+
+            <b id="market">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Market Time UTC+6</span>
+
+            <b id="time">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Current Candle</span>
+
+            <b id="candle">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Time Remaining</span>
+
+            <b id="remaining">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Live Price</span>
+
+            <b id="price">--</b>
+
+        </div>
+
+        <div class="status" id="connection">Connecting...</div>
+
+    </div>
+
+    <div class="card">
+
+        <div style="text-align:center">
+
+            NEXT CANDLE PREDICTION
+
+        </div>
+
+        <div id="prediction" class="big wait">
+
+            WAIT
+
+        </div>
+
+        <div class="row">
+
+            <span>Confidence</span>
+
+            <b id="confidence">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Score</span>
+
+            <b id="score">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Action</span>
+
+            <b id="action">WAIT</b>
+
+        </div>
+
+    </div>
+
+    <div class="card">
+
+        <b>Current Candle</b>
+
+        <div class="row">
+
+            <span>Open</span>
+
+            <b id="open">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>High</span>
+
+            <b id="high">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Low</span>
+
+            <b id="low">--</b>
+
+        </div>
+
+        <div class="row">
+
+            <span>Close / Live Price</span>
+
+            <b id="close">--</b>
+
+        </div>
+
+    </div>
+
+    <div class="card">
+
+        <b>Analysis</b>
+
+        <div id="reasons"></div>
+
+    </div>
+
+</div>
+
+<script>
+
+async function loadData() {
+
+    try {
+
+        const response = await fetch("/api/candles");
+
+        const data = await response.json();
+
+        document.getElementById("market").innerText =
+
+            data.symbol + " — REAL FOREX";
+
+        document.getElementById("time").innerText =
+
+            data.time.utc6;
+
+        document.getElementById("candle").innerText =
+
+            data.time.current_candle;
+
+        document.getElementById("remaining").innerText =
+
+            data.time.seconds_remaining === null
+
+                ? "--"
+
+                : data.time.seconds_remaining + " sec";
+
+        document.getElementById("price").innerText =
+
+            data.price === null
+
+                ? "--"
+
+                : Number(data.price).toFixed(5);
+
+        const connected = data.websocket.connected;
+
+        document.getElementById("connection").innerText =
+
+            connected
+
+                ? "🟢 LIVE PRICE CONNECTED"
+
+                : "🔴 LIVE PRICE DISCONNECTED";
+
+        const p = data.prediction;
+
+        const prediction = document.getElementById("prediction");
+
+        prediction.innerText = p.direction;
+
+        prediction.className = "big " +
+
+            (
+
+                p.direction === "UP"
+
+                    ? "up"
+
+                    : p.direction === "DOWN"
+
+                        ? "down"
+
+                        : "wait"
+
+            );
+
+        document.getElementById("confidence").innerText =
+
+            p.confidence + "%";
+
+        document.getElementById("score").innerText =
+
+            p.score ?? "--";
+
+        document.getElementById("action").innerText =
+
+            p.action;
+
+        const c = data.current_candle;
+
+        if (c) {
+
+            document.getElementById("open").innerText =
+
+                Number(c.open).toFixed(5);
+
+            document.getElementById("high").innerText =
+
+                Number(c.high).toFixed(5);
+
+            document.getElementById("low").innerText =
+
+                Number(c.low).toFixed(5);
+
+            document.getElementById("close").innerText =
+
+                Number(c.close).toFixed(5);
+
+        }
+
+        const reasons =
+
+            document.getElementById("reasons");
+
+        reasons.innerHTML = "";
+
+        if (p.reasons) {
+
+            p.reasons.forEach(function(reason) {
+
+                const div = document.createElement("div");
+
+                div.className = "reason";
+
+                div.innerText = "• " + reason;
+
+                reasons.appendChild(div);
+
+            });
+
+        }
+
+        document.getElementById("symbol").value =
+
+            data.symbol;
+
+    }
+
+    catch (error) {
+
+        document.getElementById("connection").innerText =
+
+            "🔴 API ERROR";
+
+    }
+
+}
+
+async function changeSymbol() {
+
+    const symbol =
+
+        document.getElementById("symbol").value;
+
+    await fetch(
+
+        "/api/set-symbol?symbol=" +
+
+        encodeURIComponent(symbol)
+
+    );
+
+    loadData();
+
+}
+
+loadData();
+
+setInterval(loadData, 1000);
+
+</script>
+
+</body>
+
+</html>
+
+"""
+
+# ============================================================
+
+# HTTP SERVER
+
+# ============================================================
+
+class Handler(BaseHTTPRequestHandler):
+
+    def send_json(self, data):
+
+        body = json.dumps(
+
+            data,
+
+            ensure_ascii=False
+
+        ).encode("utf-8")
+
+        self.send_response(200)
+
+        self.send_header(
+
+            "Content-Type",
+
+            "application/json; charset=utf-8"
+
+        )
+
+        self.send_header(
+
+            "Content-Length",
+
+            str(len(body))
+
+        )
+
+        self.send_header(
+
+            "Cache-Control",
+
+            "no-store"
+
+        )
+
+        self.end_headers()
+
+        self.wfile.write(body)
+
+    def do_GET(self):
+
+        parsed = urllib.parse.urlparse(
+
+            self.path
+
+        )
+
+        path = parsed.path
+
+        query = urllib.parse.parse_qs(
+
+            parsed.query
+
+        )
+
+        if path == "/":
+
+            body = HTML.encode("utf-8")
+
+            self.send_response(200)
+
+            self.send_header(
+
+                "Content-Type",
+
+                "text/html; charset=utf-8"
+
+            )
+
+            self.send_header(
+
+                "Content-Length",
+
+                str(len(body))
+
+            )
+
+            self.end_headers()
+
+            self.wfile.write(body)
+
+            return
+
+        if path == "/api/candles":
+
+            self.send_json(api_response())
+
+            return
+
+        if path == "/api/health":
+
+            with state_lock:
+
+                connected = state["ws_connected"]
+
+            self.send_json({
+
+                "status": "ok",
+
+                "mode": "CURRENT-CANDLE LIVE",
+
+                "websocket": connected
+
+            })
+
+            return
+
+        if path == "/api/set-symbol":
+
+            requested = query.get(
+
+                "symbol",
+
+                [DEFAULT_SYMBOL]
+
+            )[0]
+
+            if requested not in REAL_SYMBOLS:
+
+                self.send_json({
+
+                    "status": "error",
+
+                    "message": "Symbol not allowed."
+
+                })
+
+                return
+
+            load_symbol(requested)
+
+            self.send_json({
+
+                "status": "ok",
+
+                "symbol": requested
+
+            })
+
+            return
+
+        self.send_response(404)
+
+        self.end_headers()
+
+# ============================================================
+
+# START
+
+# ============================================================
+
+def main():
+
+    if not API_KEY:
+
+        print(
+
+            "WARNING: TWELVE_DATA_API_KEY is not configured."
+
+        )
+
+    # Seed historical data
+
+    load_symbol(DEFAULT_SYMBOL)
+
+    # Start live WebSocket
+
+    thread = threading.Thread(
+
+        target=websocket_worker,
+
+        daemon=True
+
+    )
+
+    thread.start()
+
+    # Start web server
+
+    server = ThreadingHTTPServer(
+
+        (HOST, PORT),
+
+        Handler
 
     )
 
     print(
 
-        f"Finorix AI running on "
-
-        f"http://0.0.0.0:{port}"
+        f"FINORIX AI running on port {PORT}"
 
     )
 
-    ThreadingHTTPServer(
+    print(
 
-        ("0.0.0.0", port),
+        "MODE: CURRENT-CANDLE LIVE"
 
-        Handler
+    )
 
-    ).serve_forever()
+    print(
+
+        "MARKET: REAL FOREX"
+
+    )
+
+    server.serve_forever()
+
+if __name__ == "__main__":
+
+    main()
