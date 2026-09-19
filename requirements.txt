@@ -1,1 +1,1 @@
-# No external packages required
+websocket-client
