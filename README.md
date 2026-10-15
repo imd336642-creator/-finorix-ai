@@ -1,38 +1,40 @@
-# Finorix AI — live market feed prototype
+# FINORIX PRO — corrected market scanner
 
-Mobile-friendly Finorix-style UI with a closed-candle, no-lookahead prediction engine and a live/near-live Twelve Data market feed.
+## Files
 
-## Live feed setup
+- `server.py`: HTTP API, provider selection, Twelve Data real\-FX feed, OTCharts Quotex OTC feed\.
+- `engine.py`: cautious signal scoring using completed candles\.
+- `index.html`: mobile\-friendly chart and next\-candle signal UI\.
+- `requirements.txt`: runtime dependency\.
+- `README.md`: setup notes\.
 
-1. Create a Twelve Data account and obtain an API key.
-2. Set the environment variable:
+## Render environment variables
 
-```bash
-export TWELVE_DATA_API_KEY="YOUR_API_KEY"
-```
+Set these in Render → your service → Environment:
 
-3. Run:
+- `TWELVE_DATA_API_KEY` — required for real Forex\.
+- `OTCHARTS_API_KEY` — required for Quotex OTC\.
+  Keep keys only in server\-side environment variables; never paste them into HTML or public source code\.
 
-```bash
-python server.py
-```
+The app defaults to OTC when `OTCHARTS_API_KEY` exists; otherwise it defaults to real Forex\. Use the market selector to switch\.
 
-Then open `http://localhost:8080`.
+## Start command
 
-### Render
+`python server.py`
 
-Add `TWELVE_DATA_API_KEY` under **Environment Variables** and deploy. Keep the key server-side; never put it in `index.html`.
+Python version: 3\.10\+ recommended\.
 
-## Supported live symbols
+## Important feed behavior
 
-EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF, NZD/USD, EUR/GBP.
+- OTC candles come from OTCharts’ `venue=quotex` feed and use its documented symbols &#40;for example `EURUSD_otc`&#41;\.
+- Real Forex candles come from Twelve Data\.
+- The app tries OTCharts’ live SSE stream and Twelve Data’s WebSocket for tick updates\. If the plan/API does not allow a live stream, the chart still uses REST candles; live ticks may not be available\.
+- REST candle history refresh is throttled to reduce API quota use\.
+- `1min` and `5min` are supported by this UI\. The selected provider must offer that interval for the selected symbol\.
+- Signals are generated from completed candles only and target the candle after the last completed candle\. This prevents a changing live candle from repeatedly repainting the signal\.
+- The number called “Signal strength” is derived from a rule score; it is **not** a calibrated probability or guaranteed win rate\.
+- OTCharts is an independent read\-only market\-data service, not an official Quotex API\. OTC quotes can differ from other feeds\. This app never places trades\.
 
-`USD/BDT (OTC)` and other QX OTC instruments are deliberately not mapped to the standard forex feed. OTC prices are broker-specific and need a QX-compatible data source to reproduce them accurately.
+## Deploy update
 
-## Feed behavior
-
-The browser refreshes the feed every 15 seconds. Prediction is generated only from completed candles; the currently forming candle is excluded from the signal calculation. Twelve Data documents WebSocket as the lower-latency option, while REST candle availability can lag after a candle close, so this version is a safe near-live REST implementation.
-
-## Important
-
-This is a market-data and probabilistic-analysis prototype, not a guaranteed next-candle predictor. Validate it with walk-forward/out-of-sample testing before using real money.
+Upload/replace the four code/config files in the existing GitHub repository, commit the changes, then redeploy the same Render service\. Do not create a second service unless you want a separate deployment\. Check Render logs and `/api/health` if a feed does not connect\.
