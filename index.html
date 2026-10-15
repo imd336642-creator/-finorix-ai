@@ -1,50 +1,709 @@
 <!doctype html>
+
 <html lang="en">
+
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Finorix AI</title>
+
+<meta charset="utf-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>FINORIX PRO — Next Candle Scanner</title>
+
 <style>
-*{box-sizing:border-box}body{margin:0;background:#090d12;color:#eaf0f5;font-family:Inter,system-ui,-apple-system,sans-serif}button,select{font:inherit}.app{max-width:1100px;margin:auto;padding:12px}.top{display:flex;align-items:center;justify-content:space-between;padding:8px 2px 14px}.brand{font-weight:900;letter-spacing:.5px}.brand span{color:#21d36b}.status{font-size:12px;color:#6ee89a}.toolbar{display:flex;gap:8px;flex-wrap:wrap}.toolbar select,.toolbar button{background:#121923;color:#eaf0f5;border:1px solid #263140;border-radius:10px;padding:9px 12px}.grid{display:grid;grid-template-columns:1.65fr .85fr;gap:12px}.card{background:#0e141c;border:1px solid #1e2935;border-radius:16px;overflow:hidden;box-shadow:0 10px 30px #0005}.chart{height:520px;position:relative}.chart canvas{width:100%;height:100%;display:block}.price{position:absolute;right:10px;top:50%;background:#1e9bf3;padding:5px 8px;border-radius:7px;font-size:12px}.line{position:absolute;left:0;right:60px;top:50%;border-top:1px dashed #56a7d9}.panel{padding:16px}.signal{font-size:38px;font-weight:900;margin:4px 0}.up{color:#31d66b}.down{color:#ff5b52}.wait{color:#e8c95a}.confidence{height:9px;background:#202b37;border-radius:9px;overflow:hidden;margin:12px 0}.confidence i{display:block;height:100%;width:0;background:#31d66b}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px}.meta div{background:#121a24;border-radius:10px;padding:10px}.label{font-size:11px;color:#82909e}.value{font-weight:800;margin-top:3px}.reasons{margin:14px 0 0;padding:0;list-style:none}.reasons li{padding:8px 0;border-bottom:1px solid #1d2630;font-size:13px}.history{margin-top:12px}.history table{width:100%;border-collapse:collapse;font-size:13px}.history th,.history td{text-align:left;padding:10px;border-bottom:1px solid #1c2631}.badge{padding:4px 7px;border-radius:7px;background:#18232e}.footer{padding:12px;text-align:center;color:#64717e;font-size:11px}.pulse{animation:pulse 1.2s infinite}@keyframes pulse{50%{opacity:.45}}@media(max-width:780px){.grid{grid-template-columns:1fr}.chart{height:390px}.signal{font-size:32px}}
+
+*{box-sizing:border-box}
+
+body{margin:0;background:#080d13;color:#eaf0f5;font-family:system-ui,-apple-system,sans-serif}
+
+button,select{font:inherit}
+
+.app{max-width:1200px;margin:auto;padding:12px}
+
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 2px 14px;flex-wrap:wrap}
+
+.brand{font-weight:900;letter-spacing:.5px;font-size:20px}
+
+.brand span{color:#21d36b}
+
+.status{font-size:12px;color:#9daab8}
+
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+
+.toolbar select,.toolbar button{background:#121923;color:#eaf0f5;border:1px solid #263140;border-radius:10px;padding:10px 12px}
+
+.toolbar button{background:#147bdb;border-color:#147bdb;font-weight:700}
+
+.grid{display:grid;grid-template-columns:1.6fr .9fr;gap:12px}
+
+.card{background:#0e141c;border:1px solid #1e2935;border-radius:16px;overflow:hidden}
+
+.chart{height:480px;position:relative}
+
+.chart canvas{width:100%;height:100%;display:block}
+
+.chart-title{position:absolute;left:12px;top:10px;font-size:12px;color:#b9c6d3;background:#0a111bc9;padding:6px 8px;border-radius:7px;z-index:2}
+
+.price{position:absolute;right:8px;background:#1e9bf3;padding:5px 7px;border-radius:7px;font-size:11px;transform:translateY(-50%);z-index:2}
+
+.panel{padding:16px}
+
+.signal{font-size:38px;font-weight:900;margin:4px 0}
+
+.up{color:#31d66b}
+
+.down{color:#ff5b52}
+
+.wait{color:#e8c95a}
+
+.confidence{height:8px;background:#202b37;border-radius:9px;overflow:hidden;margin:12px 0}
+
+.confidence i{display:block;height:100%;width:0;background:#31d66b}
+
+.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+
+.meta div{background:#121a24;border-radius:10px;padding:10px;min-width:0}
+
+.label{font-size:11px;color:#82909e}
+
+.value{font-weight:800;margin-top:3px;overflow-wrap:anywhere}
+
+.reasons{margin:14px 0 0;padding:0;list-style:none}
+
+.reasons li{padding:8px 0;border-bottom:1px solid #1d2630;font-size:13px}
+
+.history{margin-top:12px}
+
+.history table{width:100%;border-collapse:collapse;font-size:13px}
+
+.history th,.history td{text-align:left;padding:10px;border-bottom:1px solid #1c2631}
+
+.badge{padding:4px 7px;border-radius:7px;background:#18232e}
+
+.footer{padding:12px;text-align:center;color:#788592;font-size:11px;line-height:1.6}
+
+.note{margin-top:10px;padding:10px;border:1px solid #4d4321;background:#211c10;color:#d8c98a;border-radius:10px;font-size:12px;line-height:1.5}
+
+.pulse{animation:pulse 1.2s infinite}
+
+@keyframes pulse{50%{opacity:.45}}
+
+@media(max-width:780px){
+
+.grid{grid-template-columns:1fr}
+
+.chart{height:370px}
+
+.signal{font-size:32px}
+
+.toolbar select,.toolbar button{flex:1;min-width:130px}
+
+.history{overflow-x:auto}
+
+.history table{min-width:560px}
+
+}
+
 </style>
+
 </head>
-<body><main class="app">
-<header class="top"><div class="brand">✦ FINORIX <span>AI</span></div><div class="status"><b class="pulse">● LIVE</b> &nbsp; prototype engine</div></header>
-<div class="toolbar"><select id="pair"><option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option><option>USD/BDT (OTC)</option></select><select id="tf"><option>1M</option><option>5M</option></select><button id="analyze">Analyze closed candle</button></div>
-<section class="grid"><div class="card chart"><canvas id="chart"></canvas><div class="line"></div><div class="price" id="price">—</div></div>
-<aside class="card panel"><div class="label">NEXT CANDLE</div><div id="signal" class="signal wait">WAIT</div><div id="confidenceText">Confidence 50%</div><div class="confidence"><i id="bar"></i></div><div class="meta"><div><div class="label">PAIR</div><div class="value" id="pairText">EUR/USD</div></div><div><div class="label">TIMEFRAME</div><div class="value">1 MIN</div></div><div><div class="label">ACTION</div><div class="value" id="action">WAIT</div></div><div><div class="label">MODE</div><div class="value">CLOSED-CANDLE</div></div></div><ul id="reasons" class="reasons"><li>Waiting for analysis…</li></ul></aside></section>
-<section class="card panel history"><div class="label">SIGNAL HISTORY</div><table><thead><tr><th>Time</th><th>Pair</th><th>Prediction</th><th>Confidence</th><th>Result</th></tr></thead><tbody id="history"></tbody></table></section>
-<div class="footer">Prototype only. Predictions are probabilistic and not guaranteed. Use historical testing before any real-money trading.</div>
+
+<body>
+
+<main class="app">
+
+<header class="top">
+
+<div class="brand">✦ FINORIX <span>PRO</span></div>
+
+<div class="status" id="status"><b class="pulse">● CONNECTING</b></div>
+
+</header>
+
+<div class="toolbar">
+
+<select id="mode">
+
+<option value="otc">Quotex OTC</option>
+
+<option value="real">Real Forex</option>
+
+</select>
+
+<select id="pair"></select>
+
+<select id="tf">
+
+<option value="1min">1 Minute</option>
+
+<option value="5min">5 Minutes</option>
+
+</select>
+
+<button id="apply">Apply market</button>
+
+</div>
+
+<section class="grid">
+
+<div class="card chart">
+
+<div class="chart-title" id="chartTitle">Waiting for candle data…</div>
+
+<canvas id="chart"></canvas>
+
+<div class="price" id="priceTag" hidden>—</div>
+
+</div>
+
+<aside class="card panel">
+
+<div class="label">SIGNAL FOR NEXT CANDLE</div>
+
+<div id="signal" class="signal wait">WAIT</div>
+
+<div id="strengthText">Signal strength: —</div>
+
+<div class="confidence"><i id="bar"></i></div>
+
+<div class="meta">
+
+<div><div class="label">MARKET</div><div class="value" id="marketText">—</div></div>
+
+<div><div class="label">TIMEFRAME</div><div class="value" id="tfText">1 MIN</div></div>
+
+<div><div class="label">ACTION</div><div class="value" id="action">WAIT</div></div>
+
+<div><div class="label">FEED</div><div class="value" id="feed">—</div></div>
+
+<div><div class="label">CURRENT CANDLE ENDS IN</div><div class="value" id="remaining">—</div></div>
+
+<div><div class="label">LAST COMPLETED CANDLE</div><div class="value" id="lastClosed">—</div></div>
+
+</div>
+
+<ul id="reasons" class="reasons">
+
+<li>Waiting for analysis…</li>
+
+</ul>
+
+<div class="note">
+
+Signals are calculated from completed candles and apply to the candle after the last completed candle. Signal strength is not a verified win probability. OTC quotes can differ from other feeds.
+
+</div>
+
+</aside>
+
+</section>
+
+<section class="card panel history">
+
+<div class="label">RECENT SIGNAL CHANGES</div>
+
+<table>
+
+<thead>
+
+<tr><th>Time</th><th>Market</th><th>Signal</th><th>Strength</th><th>Score</th></tr>
+
+</thead>
+
+<tbody id="history">
+
+<tr><td colspan="5">No signals yet</td></tr>
+
+</tbody>
+
+</table>
+
+</section>
+
+<div class="footer">
+
+Read-only scanner: it does not place trades. A candle prediction can be wrong even with strong-looking conditions. Test on demo and review a large sample before risking money.
+
+</div>
+
 </main>
+
 <script>
-const canvas=document.getElementById('chart'),ctx=canvas.getContext('2d');
-let candles=[],history=[],lastAnalyzedClosed='';
-const pairEl=document.getElementById('pair'),tfEl=document.getElementById('tf');
-function interval(){return tfEl.value==='5M'?'5min':'1min'}
+
+const canvas=document.getElementById('chart');
+
+const ctx=canvas.getContext('2d');
+
+const modeEl=document.getElementById('mode');
+
+const pairEl=document.getElementById('pair');
+
+const tfEl=document.getElementById('tf');
+
+let candles=[];
+
+let lastSignalKey='';
+
+let signalHistory=[];
+
+let lastState=null;
+
+const OTC=[
+
+['EUR/USD (OTC)','EUR/USD OTC'],
+
+['GBP/USD (OTC)','GBP/USD OTC'],
+
+['USD/JPY (OTC)','USD/JPY OTC'],
+
+['AUD/USD (OTC)','AUD/USD OTC'],
+
+['BTC/USD (OTC)','BTC/USD OTC']
+
+];
+
+const REAL=[
+
+'EUR/USD','GBP/USD','USD/JPY','AUD/USD',
+
+'USD/CAD','USD/CHF','NZD/USD','EUR/GBP'
+
+];
+
+function fillPairs(){
+
+const vals=modeEl.value==='otc'?OTC.map(x=>x[0]):REAL;
+
+const old=pairEl.value;
+
+pairEl.innerHTML='';
+
+vals.forEach(v=>{
+
+const o=document.createElement('option');
+
+o.value=v;
+
+o.textContent=v;
+
+pairEl.appendChild(o);
+
+});
+
+if(vals.includes(old))pairEl.value=old;
+
+}
+
+function fmtTime(ts){
+
+if(!ts)return '—';
+
+return new Date(ts*1000).toLocaleTimeString([],{
+
+hour:'2-digit',minute:'2-digit',second:'2-digit'
+
+});
+
+}
+
 function draw(){
-  if(!candles.length)return;
-  let d=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=w*d;canvas.height=h*d;ctx.setTransform(d,0,0,d,0,0);ctx.clearRect(0,0,w,h);
-  let lo=Math.min(...candles.map(x=>x.low)),hi=Math.max(...candles.map(x=>x.high)),pad=25;const span=Math.max(hi-lo,1e-9),y=v=>h-pad-(v-lo)/span*(h-pad*2),cw=Math.max(5,w/candles.length*.62);
-  candles.forEach((c,i)=>{let x=12+i*(w-24)/candles.length,yy=y(c.close),yo=y(c.open);ctx.strokeStyle='#6f7c88';ctx.beginPath();ctx.moveTo(x,y(c.low));ctx.lineTo(x,y(c.high));ctx.stroke();ctx.fillStyle=c.close>=c.open?'#22d36a':'#ff554d';ctx.fillRect(x-cw/2,Math.min(yo,yy),cw,Math.max(2,Math.abs(yy-yo)));});
-  document.getElementById('price').textContent=candles.at(-1).close.toFixed(5);
+
+const d=window.devicePixelRatio||1;
+
+const w=canvas.clientWidth;
+
+const h=canvas.clientHeight;
+
+if(!w||!h)return;
+
+canvas.width=w*d;
+
+canvas.height=h*d;
+
+ctx.setTransform(d,0,0,d,0,0);
+
+ctx.clearRect(0,0,w,h);
+
+if(!candles.length){
+
+ctx.fillStyle='#82909e';
+
+ctx.font='13px system-ui';
+
+ctx.fillText('Waiting for market candles…',18,45);
+
+return;
+
 }
-function renderPrediction(x){
-  let s=document.getElementById('signal');s.textContent=x.direction;s.className='signal '+(x.direction==='UP'?'up':x.direction==='DOWN'?'down':'wait');
-  document.getElementById('confidenceText').textContent='Confidence '+x.confidence+'%';document.getElementById('bar').style.width=x.confidence+'%';
-  document.getElementById('pairText').textContent=pairEl.value;document.getElementById('action').textContent=x.direction==='UP'?'BUY':x.direction==='DOWN'?'SELL':'WAIT';
-  document.getElementById('reasons').innerHTML=x.reasons.map(v=>'<li>✓ '+v+'</li>').join('');
+
+const visible=candles.slice(-55);
+
+const pad={t:35,b:30,l:12,r:62};
+
+let lo=Math.min(...visible.map(c=>Number(c.low)));
+
+let hi=Math.max(...visible.map(c=>Number(c.high)));
+
+if(!Number.isFinite(lo)||!Number.isFinite(hi))return;
+
+const extra=Math.max((hi-lo)*.08,Math.abs(hi)*.00001,1e-8);
+
+lo-=extra;
+
+hi+=extra;
+
+const plotW=w-pad.l-pad.r;
+
+const plotH=h-pad.t-pad.b;
+
+const span=Math.max(hi-lo,1e-12);
+
+const y=v=>pad.t+(hi-v)/span*plotH;
+
+const step=plotW/visible.length;
+
+const cw=Math.max(3,Math.min(12,step*.62));
+
+ctx.strokeStyle='#1d2935';
+
+ctx.lineWidth=1;
+
+ctx.fillStyle='#82909e';
+
+ctx.font='10px system-ui';
+
+for(let i=0;i<=4;i++){
+
+const yy=pad.t+i*plotH/4;
+
+ctx.beginPath();
+
+ctx.moveTo(pad.l,yy);
+
+ctx.lineTo(w-pad.r,yy);
+
+ctx.stroke();
+
+const v=hi-i*span/4;
+
+ctx.fillText(v.toFixed(Math.abs(v)<10?5:2),w-pad.r+5,yy+3);
+
 }
-function addHistory(x,stamp){
-  history.unshift({time:new Date(stamp.replace(' ','T')+'Z').toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),pair:pairEl.value,p:x.direction,c:x.confidence,result:'Pending'});history=history.slice(0,8);
-  document.getElementById('history').innerHTML=history.map(v=>`<tr><td>${v.time}</td><td>${v.pair}</td><td><span class="badge">${v.p}</span></td><td>${v.c}%</td><td>${v.result}</td></tr>`).join('');
+
+visible.forEach((c,i)=>{
+
+const x=pad.l+step*(i+.5);
+
+const o=y(Number(c.open));
+
+const cl=y(Number(c.close));
+
+const hh=y(Number(c.high));
+
+const ll=y(Number(c.low));
+
+const up=Number(c.close)>=Number(c.open);
+
+ctx.strokeStyle=up?'#31d66b':'#ff5b52';
+
+ctx.lineWidth=1.2;
+
+ctx.beginPath();
+
+ctx.moveTo(x,hh);
+
+ctx.lineTo(x,ll);
+
+ctx.stroke();
+
+ctx.fillStyle=up?'#31d66b':'#ff5b52';
+
+ctx.fillRect(x-cw/2,Math.min(o,cl),cw,Math.max(1.5,Math.abs(cl-o)));
+
+if(i%Math.max(1,Math.floor(visible.length/5))===0){
+
+ctx.fillStyle='#82909e';
+
+ctx.fillText(fmtTime(c.timestamp),x-20,h-9);
+
 }
-async function refresh(force=false){
-  const status=document.querySelector('.status');
-  try{
-    const r=await fetch('/api/candles?symbol='+encodeURIComponent(pairEl.value)+'&interval='+interval(),{cache:'no-store'});const x=await r.json();if(!r.ok)throw new Error(x.error||'Feed unavailable');
-    candles=x.candles;draw();status.innerHTML='<b class="pulse">● LIVE</b> &nbsp; '+x.source;
-    renderPrediction(x.prediction);
-    if(force||x.last_closed_timestamp!==lastAnalyzedClosed){lastAnalyzedClosed=x.last_closed_timestamp;if(!force)addHistory(x.prediction,x.last_closed_timestamp);}
-  }catch(e){status.innerHTML='<b style="color:#ff6b62">● FEED ERROR</b> &nbsp; '+e.message;}
+
+});
+
+const last=visible[visible.length-1];
+
+const py=y(Number(last.close));
+
+ctx.setLineDash([4,4]);
+
+ctx.strokeStyle='#4aa7e8';
+
+ctx.beginPath();
+
+ctx.moveTo(pad.l,py);
+
+ctx.lineTo(w-pad.r,py);
+
+ctx.stroke();
+
+ctx.setLineDash([]);
+
+const tag=document.getElementById('priceTag');
+
+tag.hidden=false;
+
+tag.textContent=Number(last.close).toFixed(5);
+
+tag.style.top=Math.max(24,Math.min(h-25,py))+'px';
+
+document.getElementById('chartTitle').textContent=
+
+(lastState?.symbol||pairEl.value)+' · '+
+
+(lastState?.interval||tfEl.value)+' · '+
+
+visible.length+' candles';
+
 }
-window.addEventListener('resize',draw);pairEl.onchange=()=>{lastAnalyzedClosed='';refresh(true)};tfEl.onchange=()=>{lastAnalyzedClosed='';refresh(true)};refresh(true);setInterval(()=>refresh(false),15000);
-</script></body></html>
+
+function renderPrediction(p,data){
+
+const el=document.getElementById('signal');
+
+el.textContent=p.direction||'WAIT';
+
+el.className='signal '+
+
+(p.direction==='UP'?'up':
+
+p.direction==='DOWN'?'down':'wait');
+
+document.getElementById('strengthText').textContent=
+
+'Signal strength: '+(p.confidence??'—')+'%';
+
+document.getElementById('bar').style.width=
+
+Math.min(100,Math.max(0,p.confidence||0))+'%';
+
+document.getElementById('bar').style.background=
+
+p.direction==='DOWN'?'#ff5b52':
+
+p.direction==='UP'?'#31d66b':'#e8c95a';
+
+document.getElementById('marketText').textContent=data.symbol||'—';
+
+document.getElementById('tfText').textContent=
+
+data.interval==='5min'?'5 MIN':'1 MIN';
+
+document.getElementById('action').textContent=
+
+p.action||(p.direction==='UP'?'NEXT CANDLE BUY':
+
+p.direction==='DOWN'?'NEXT CANDLE SELL':'WAIT');
+
+document.getElementById('feed').textContent=data.source||'—';
+
+document.getElementById('remaining').textContent=
+
+data.time?.seconds_remaining==null?'—':
+
+data.time.seconds_remaining+' sec';
+
+document.getElementById('lastClosed').textContent=
+
+fmtTime(data.last_closed_timestamp);
+
+const reasons=document.getElementById('reasons');
+
+reasons.innerHTML='';
+
+(p.reasons||['Waiting for enough completed candles']).forEach(v=>{
+
+const li=document.createElement('li');
+
+li.textContent='• '+v;
+
+reasons.appendChild(li);
+
+});
+
+const key=[
+
+data.mode,data.symbol,data.interval,data.last_closed_timestamp,
+
+p.direction,p.score
+
+].join('|');
+
+if(data.last_closed_timestamp&&key!==lastSignalKey){
+
+lastSignalKey=key;
+
+signalHistory.unshift({
+
+time:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
+
+market:data.symbol,
+
+signal:p.direction,
+
+strength:p.confidence,
+
+score:p.score
+
+});
+
+signalHistory=signalHistory.slice(0,8);
+
+document.getElementById('history').innerHTML=
+
+signalHistory.map(v=>`<tr>
+
+<td>${v.time}</td>
+
+<td>${v.market}</td>
+
+<td><span class="badge">${v.signal}</span></td>
+
+<td>${v.strength??'—'}%</td>
+
+<td>${v.score??'—'}</td>
+
+</tr>`).join('');
+
+}
+
+}
+
+async function refresh(){
+
+try{
+
+const qs=new URLSearchParams({
+
+mode:modeEl.value,
+
+symbol:pairEl.value,
+
+interval:tfEl.value
+
+});
+
+const r=await fetch('/api/candles?'+qs.toString(),{
+
+cache:'no-store'
+
+});
+
+const data=await r.json();
+
+if(!r.ok||data.status==='error'){
+
+throw new Error(data.error||'Feed unavailable');
+
+}
+
+lastState=data;
+
+candles=Array.isArray(data.candles)?data.candles:[];
+
+draw();
+
+renderPrediction(
+
+data.prediction||{
+
+direction:'WAIT',
+
+confidence:50,
+
+reasons:['Waiting for analysis']
+
+},
+
+data
+
+);
+
+const live=data.websocket?.connected;
+
+document.getElementById('status').innerHTML=
+
+(live?
+
+'<b class="pulse" style="color:#6ee89a">● LIVE STREAM</b>':
+
+'<b style="color:#e8c95a">● CANDLE FEED</b>')+
+
+' &nbsp; '+(data.error?String(data.error):
+
+'Updated '+new Date().toLocaleTimeString());
+
+}catch(e){
+
+document.getElementById('status').innerHTML=
+
+'<b style="color:#ff6b62">● FEED ERROR</b> &nbsp; '+
+
+String(e.message);
+
+}
+
+}
+
+document.getElementById('apply').addEventListener('click',async()=>{
+
+try{
+
+const r=await fetch('/api/set-market?'+new URLSearchParams({
+
+mode:modeEl.value,
+
+symbol:pairEl.value,
+
+interval:tfEl.value
+
+}));
+
+const x=await r.json();
+
+if(!r.ok)throw new Error(x.error||'Could not change market');
+
+lastSignalKey='';
+
+signalHistory=[];
+
+document.getElementById('history').innerHTML=
+
+'<tr><td colspan="5">No signals yet</td></tr>';
+
+await refresh();
+
+}catch(e){
+
+document.getElementById('status').textContent=
+
+'Market change failed: '+e.message;
+
+}
+
+});
+
+modeEl.addEventListener('change',fillPairs);
+
+window.addEventListener('resize',draw);
+
+fillPairs();
+
+refresh();
+
+setInterval(refresh,4000);
+
+</script>
+
+</body>
+
+</html>
