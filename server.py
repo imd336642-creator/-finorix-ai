@@ -1,1755 +1,455 @@
-import os
+"""FINORIX PRO — live/near-live read-only market scanner.
 
+Providers:
+- OTCharts Quotex venue for OTC symbols (OTCHARTS_API_KEY)
+- Twelve Data for real forex symbols (TWELVE_DATA_API_KEY)
+
+The app never places trades. Signals are calculated from completed candles only.
+"""
 import json
-
-import time
-
-import math
-
+import os
 import threading
-
+import time
 import urllib.parse
-
 import urllib.request
-
-from datetime import datetime, timezone
-
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-import websocket
-
-# ============================================================
-
-# FINORIX AI — LIVE CURRENT CANDLE
-
-# ============================================================
-
-API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+from engine import predict_next_candle
 
 HOST = "0.0.0.0"
-
 PORT = int(os.getenv("PORT", "10000"))
+TWELVE_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+OTCHARTS_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
+BASE_DIR = Path(__file__).resolve().parent
 
-WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
-
-REAL_SYMBOLS = [
-
-    "EUR/USD",
-
-    "GBP/USD",
-
-    "USD/JPY",
-
-    "AUD/USD",
-
-    "USD/CAD",
-
-    "USD/CHF",
-
-    "NZD/USD",
-
-    "EUR/GBP",
-
-]
-
-DEFAULT_SYMBOL = "EUR/USD"
-
-state_lock = threading.Lock()
-
-state = {
-
-    "symbol": DEFAULT_SYMBOL,
-
-    "price": None,
-
-    "current": None,
-
-    "previous": None,
-
-    "history": [],
-
-    "prediction": None,
-
-    "ws_connected": False,
-
-    "last_tick": None,
-
-    "error": None,
-
+REAL_SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD", "EUR/GBP"]
+OTC_SYMBOLS = {
+    "EUR/USD (OTC)": "EURUSD_otc",
+    "GBP/USD (OTC)": "GBPUSD_otc",
+    "USD/JPY (OTC)": "USDJPY_otc",
+    "AUD/USD (OTC)": "AUDUSD_otc",
+    "BTC/USD (OTC)": "BTCUSD_otc",
 }
+TIMEFRAMES = {"1min": 60, "5min": 300}
 
-# ============================================================
+lock = threading.RLock()
+state = {
+    "mode": "otc" if OTCHARTS_KEY else "real",
+    "symbol": "EUR/USD (OTC)" if OTCHARTS_KEY else "EUR/USD",
+    "interval": "1min",
+    "candles": [],
+    "live_price": None,
+    "last_tick": None,
+    "last_refresh": 0,
+    "source": "Starting",
+    "error": None,
+    "otc_stream_connected": False,
+    "real_ws_connected": False,
+}
+real_ws = None
 
-# TIME
 
-# ============================================================
-
-def now_utc():
-
-    return datetime.now(timezone.utc)
-
-def minute_start(ts):
-
-    return ts - (ts % 60)
-
-def format_time_utc6(ts):
-
+def utc_string(ts):
     if ts is None:
-
         return "--"
+    return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    dt = datetime.fromtimestamp(ts, timezone.utc)
 
-    # Bangladesh UTC+6 display
-
-    from datetime import timedelta
-
-    dt = dt + timedelta(hours=6)
-
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-def format_time_utc(ts):
-
+def local_string(ts):
     if ts is None:
-
         return "--"
-
-    dt = datetime.fromtimestamp(ts, timezone.utc)
-
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-# ============================================================
-
-# TWELVE DATA REST
-
-# Used only for historical/previous candle + EMA context.
-
-# Current candle comes from WebSocket ticks.
-
-# ============================================================
-
-def fetch_history(symbol):
-
-    if not API_KEY:
-
-        return []
-
-    params = urllib.parse.urlencode({
-
-        "symbol": symbol,
-
-        "interval": "1min",
-
-        "outputsize": 120,
-
-        "timezone": "UTC",
-
-        "apikey": API_KEY,
-
-    })
-
-    url = "https://api.twelvedata.com/time_series?" + params
-
-    try:
-
-        req = urllib.request.Request(
-
-            url,
-
-            headers={"User-Agent": "FinorixAI/1.0"}
-
-        )
-
-        with urllib.request.urlopen(req, timeout=15) as response:
-
-            data = json.loads(response.read().decode("utf-8"))
-
-        if data.get("status") == "error":
-
-            raise RuntimeError(data.get("message", "Twelve Data error"))
-
-        rows = data.get("values", [])
-
-        candles = []
-
-        for row in rows:
-
-            try:
-
-                dt = datetime.strptime(
-
-                    row["datetime"],
-
-                    "%Y-%m-%d %H:%M:%S"
-
-                ).replace(tzinfo=timezone.utc)
-
-                candles.append({
-
-                    "timestamp": int(dt.timestamp()),
-
-                    "open": float(row["open"]),
-
-                    "high": float(row["high"]),
-
-                    "low": float(row["low"]),
-
-                    "close": float(row["close"]),
-
-                })
-
-            except Exception:
-
-                continue
-
-        candles.sort(key=lambda x: x["timestamp"])
-
-        return candles
-
-    except Exception as e:
-
-        with state_lock:
-
-            state["error"] = str(e)
-
-        return []
-
-# ============================================================
-
-# EMA
-
-# ============================================================
-
-def ema(values, period):
-
-    if not values:
-
-        return None
-
-    if len(values) < period:
-
-        period = len(values)
-
-    if period <= 0:
-
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    result = sum(values[:period]) / period
-
-    for value in values[period:]:
-
-        result = ((value - result) * multiplier) + result
-
-    return result
-
-# ============================================================
-
-# CANDLE HELPERS
-
-# ============================================================
-
-def candle_body(c):
-
-    return abs(c["close"] - c["open"])
-
-def candle_range(c):
-
-    return max(c["high"] - c["low"], 1e-12)
-
-def candle_direction(c):
-
-    if c["close"] > c["open"]:
-
-        return 1
-
-    if c["close"] < c["open"]:
-
-        return -1
-
-    return 0
-
-def body_strength(c):
-
-    return candle_body(c) / candle_range(c)
-
-def upper_wick(c):
-
-    return c["high"] - max(c["open"], c["close"])
-
-def lower_wick(c):
-
-    return min(c["open"], c["close"]) - c["low"]
-
-# ============================================================
-
-# LIVE CANDLE CREATION
-
-# ============================================================
-
-def create_live_candle(ts, price):
-
-    start = minute_start(ts)
-
+    # Bangladesh time (UTC+6) as requested by the original prototype.
+    return (datetime.fromtimestamp(float(ts), timezone.utc) + timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def http_json(url, headers=None, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": "FinorixPro/1.0", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def normalize_candle(row, timestamp_key="timestamp"):
+    ts = row.get(timestamp_key, row.get("time", row.get("datetime", 0)))
+    if isinstance(ts, str):
+        try:
+            ts = int(datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            ts = int(float(ts))
     return {
-
-        "timestamp": start,
-
-        "open": price,
-
-        "high": price,
-
-        "low": price,
-
-        "close": price,
-
+        "timestamp": int(float(ts)),
+        "open": float(row["open"]), "high": float(row["high"]),
+        "low": float(row["low"]), "close": float(row["close"]),
     }
 
-def update_live_candle(ts, price):
 
-    with state_lock:
+def fetch_twelve_candles(symbol, interval, limit=100):
+    if not TWELVE_KEY:
+        raise RuntimeError("TWELVE_DATA_API_KEY is missing in Render Environment Variables.")
+    params = urllib.parse.urlencode({
+        "symbol": symbol, "interval": interval, "outputsize": limit,
+        "timezone": "UTC", "apikey": TWELVE_KEY,
+    })
+    data = http_json("https://api.twelvedata.com/time_series?" + params)
+    if data.get("status") == "error" or "values" not in data:
+        raise RuntimeError(data.get("message", "Twelve Data returned no candle values."))
+    candles = []
+    for row in data["values"]:
+        try:
+            candles.append(normalize_candle(row, "datetime"))
+        except (ValueError, TypeError, KeyError):
+            continue
+    return sorted(candles, key=lambda x: x["timestamp"])[-limit:]
 
-        current = state["current"]
 
-        if current is None:
+def fetch_otc_candles(symbol, interval, limit=100):
+    if not OTCHARTS_KEY:
+        raise RuntimeError("OTCHARTS_API_KEY is missing in Render Environment Variables.")
+    otc_id = OTC_SYMBOLS.get(symbol)
+    if not otc_id:
+        raise RuntimeError("This OTC symbol is not mapped. Choose a listed OTC symbol.")
+    tf = TIMEFRAMES[interval]
+    params = urllib.parse.urlencode({"venue": "quotex", "symbol": otc_id, "tf": tf, "limit": limit})
+    data = http_json("https://otcharts.com/v1/candles?" + params, {"Authorization": "Bearer " + OTCHARTS_KEY})
+    if "candles" not in data:
+        raise RuntimeError(data.get("error", "OTCharts returned no candles."))
+    candles = []
+    for row in data["candles"]:
+        try:
+            candles.append(normalize_candle(row, "time"))
+        except (ValueError, TypeError, KeyError):
+            continue
+    return sorted(candles, key=lambda x: x["timestamp"])[-limit:]
 
-            state["current"] = create_live_candle(ts, price)
 
-            state["price"] = price
+def fetch_candles(mode, symbol, interval):
+    if mode == "otc":
+        return fetch_otc_candles(symbol, interval)
+    return fetch_twelve_candles(symbol, interval)
 
-            state["last_tick"] = ts
 
+def current_interval_start(ts, interval):
+    size = TIMEFRAMES[interval]
+    return int(ts // size * size)
+
+
+def refresh_history(force=False):
+    with lock:
+        mode, symbol, interval = state["mode"], state["symbol"], state["interval"]
+        last_refresh = state["last_refresh"]
+    # Avoid burning API quota: refresh historical bars at most every 30 seconds,
+    # while browser polling itself does not trigger provider requests each time.
+    if not force and time.time() - last_refresh < 30:
+        return
+    try:
+        candles = fetch_candles(mode, symbol, interval)
+        now = time.time()
+        # If the provider includes the currently forming bar, it is displayed
+        # but excluded from prediction. If the latest bar is older, it is closed.
+        with lock:
+            if (state["mode"], state["symbol"], state["interval"]) != (mode, symbol, interval):
+                return
+            state["candles"] = candles
+            state["last_refresh"] = now
+            state["source"] = "OTCharts · Quotex OTC candles" if mode == "otc" else "Twelve Data · real forex candles"
+            state["error"] = None
+    except Exception as exc:
+        with lock:
+            state["error"] = str(exc)
+            state["last_refresh"] = time.time()
+            state["source"] = "Feed error"
+
+
+def selected_tick_price(symbol, price, ts, mode):
+    with lock:
+        if mode != state["mode"] or symbol != state["symbol"]:
             return
-
-        current_start = current["timestamp"]
-
-        incoming_start = minute_start(ts)
-
-        # New minute started
-
-        if incoming_start > current_start:
-
-            state["previous"] = current.copy()
-
-            # Save completed candle
-
-            state["history"].append(current.copy())
-
-            if len(state["history"]) > 150:
-
-                state["history"] = state["history"][-150:]
-
-            state["current"] = create_live_candle(ts, price)
-
-        # Ignore old tick
-
-        elif incoming_start < current_start:
-
-            return
-
-        else:
-
-            current["high"] = max(current["high"], price)
-
-            current["low"] = min(current["low"], price)
-
-            current["close"] = price
-
-        state["price"] = price
-
+        interval = state["interval"]
+        candles = list(state["candles"])
+    start = current_interval_start(ts, interval)
+    if not candles:
+        return
+    with lock:
+        # Only mutate a bar if its timestamp matches the tick's interval;
+        # otherwise leave history intact and let the next REST refresh add bars.
+        if candles[-1]["timestamp"] == start:
+            c = state["candles"][-1]
+            c["high"] = max(c["high"], price)
+            c["low"] = min(c["low"], price)
+            c["close"] = price
+        elif candles[-1]["timestamp"] < start:
+            state["candles"].append({"timestamp": start, "open": price, "high": price, "low": price, "close": price})
+            state["candles"] = state["candles"][-150:]
+        state["live_price"] = price
         state["last_tick"] = ts
 
-# ============================================================
 
-# PREDICTION ENGINE
-
-# IMPORTANT:
-
-# Prediction is ALWAYS for the NEXT candle.
-
-# ============================================================
-
-def analyze_current(symbol):
-
-    with state_lock:
-
-        current = state["current"].copy() if state["current"] else None
-
-        previous = state["previous"].copy() if state["previous"] else None
-
-        history = list(state["history"])
-
-        price = state["price"]
-
-    if not current or price is None:
-
-        return {
-
-            "direction": "WAIT",
-
-            "confidence": 0,
-
-            "action": "WAIT",
-
-            "reason": "Waiting for live candle data."
-
-        }
-
-    # --------------------------------------------------------
-
-    # Build close history for EMA
-
-    # --------------------------------------------------------
-
-    closes = [x["close"] for x in history]
-
-    if previous:
-
-        closes.append(previous["close"])
-
-    closes.append(current["close"])
-
-    ema5 = ema(closes, 5)
-
-    ema10 = ema(closes, 10)
-
-    ema20 = ema(closes, 20)
-
-    # --------------------------------------------------------
-
-    # Current candle measurements
-
-    # --------------------------------------------------------
-
-    body = candle_body(current)
-
-    rng = candle_range(current)
-
-    body_strength_value = body / rng
-
-    uw = upper_wick(current)
-
-    lw = lower_wick(current)
-
-    position = (
-
-        (price - current["low"]) /
-
-        max(current["high"] - current["low"], 1e-12)
-
-    )
-
-    current_dir = candle_direction(current)
-
-    score = 0
-
-    reasons = []
-
-    # --------------------------------------------------------
-
-    # Current candle direction
-
-    # --------------------------------------------------------
-
-    if current_dir > 0:
-
-        score += 2
-
-        reasons.append("Current candle is bullish")
-
-    elif current_dir < 0:
-
-        score -= 2
-
-        reasons.append("Current candle is bearish")
-
-    # --------------------------------------------------------
-
-    # Body strength
-
-    # --------------------------------------------------------
-
-    if body_strength_value >= 0.60:
-
-        if current_dir > 0:
-
-            score += 1
-
-            reasons.append("Strong bullish body")
-
-        elif current_dir < 0:
-
-            score -= 1
-
-            reasons.append("Strong bearish body")
-
-    # --------------------------------------------------------
-
-    # Current price position
-
-    # --------------------------------------------------------
-
-    if position >= 0.75:
-
-        score += 1
-
-        reasons.append("Price is near current high")
-
-    elif position <= 0.25:
-
-        score -= 1
-
-        reasons.append("Price is near current low")
-
-    # --------------------------------------------------------
-
-    # Wick rejection
-
-    # --------------------------------------------------------
-
-    if uw > body * 1.2 and uw > lw:
-
-        score -= 1
-
-        reasons.append("Upper-wick rejection")
-
-    if lw > body * 1.2 and lw > uw:
-
-        score += 1
-
-        reasons.append("Lower-wick rejection")
-
-    # --------------------------------------------------------
-
-    # Previous candle
-
-    # --------------------------------------------------------
-
-    if previous:
-
-        prev_dir = candle_direction(previous)
-
-        if prev_dir > 0:
-
-            score += 1
-
-            reasons.append("Previous candle bullish")
-
-        elif prev_dir < 0:
-
-            score -= 1
-
-            reasons.append("Previous candle bearish")
-
-        # Break previous high
-
-        if price > previous["high"]:
-
-            score += 2
-
-            reasons.append("Live price broke previous high")
-
-        # Break previous low
-
-        elif price < previous["low"]:
-
-            score -= 2
-
-            reasons.append("Live price broke previous low")
-
-    # --------------------------------------------------------
-
-    # Short momentum
-
-    # --------------------------------------------------------
-
-    if len(closes) >= 4:
-
-        recent = closes[-4:]
-
-        up_count = sum(
-
-            1 for i in range(1, len(recent))
-
-            if recent[i] > recent[i - 1]
-
-        )
-
-        down_count = sum(
-
-            1 for i in range(1, len(recent))
-
-            if recent[i] < recent[i - 1]
-
-        )
-
-        if up_count >= 2 and down_count == 0:
-
-            score += 2
-
-            reasons.append("Short momentum bullish")
-
-        elif down_count >= 2 and up_count == 0:
-
-            score -= 2
-
-            reasons.append("Short momentum bearish")
-
-    # --------------------------------------------------------
-
-    # EMA structure
-
-    # --------------------------------------------------------
-
-    if ema5 is not None and ema10 is not None:
-
-        if price > ema5 > ema10:
-
-            score += 2
-
-            reasons.append("Bullish EMA structure")
-
-        elif price < ema5 < ema10:
-
-            score -= 2
-
-            reasons.append("Bearish EMA structure")
-
-    # EMA20 extra context
-
-    if ema20 is not None:
-
-        if price > ema20:
-
-            score += 1
-
-            reasons.append("Price above EMA20")
-
-        elif price < ema20:
-
-            score -= 1
-
-            reasons.append("Price below EMA20")
-
-    # --------------------------------------------------------
-
-    # FINAL QUALITY FILTER
-
-    # --------------------------------------------------------
-
-    if score >= 7:
-
-        direction = "UP"
-
-    elif score <= -7:
-
-        direction = "DOWN"
-
-    else:
-
-        direction = "WAIT"
-
-    confidence = min(92, 50 + abs(score) * 5)
-
-    if direction == "WAIT":
-
-        confidence = min(confidence, 64)
-
-    action = {
-
-        "UP": "NEXT CANDLE BUY",
-
-        "DOWN": "NEXT CANDLE SELL",
-
-        "WAIT": "WAIT"
-
-    }[direction]
-
-    return {
-
-        "direction": direction,
-
-        "confidence": confidence,
-
-        "action": action,
-
-        "score": score,
-
-        "reasons": reasons[-8:],
-
-        "current": current,
-
-        "previous": previous,
-
-        "ema5": ema5,
-
-        "ema10": ema10,
-
-        "ema20": ema20,
-
-        "body_strength": round(body_strength_value, 4),
-
-        "price_position": round(position, 4),
-
-        "upper_wick": uw,
-
-        "lower_wick": lw,
-
-    }
-
-# ============================================================
-
-# WEBSOCKET
-
-# ============================================================
-
-def websocket_url():
-
-    return WS_URL + "?apikey=" + urllib.parse.quote(API_KEY)
-
-def subscribe(ws):
-
-    message = {
-
-        "action": "subscribe",
-
-        "params": {
-
-            "symbols": ",".join(REAL_SYMBOLS)
-
-        }
-
-    }
-
-    ws.send(json.dumps(message))
-
-def websocket_worker():
-
+def otc_stream_worker():
+    """Connect to OTCharts SSE stream. If plan does not permit streaming, REST still works."""
+    import urllib.error
     while True:
-
-        if not API_KEY:
-
-            with state_lock:
-
-                state["ws_connected"] = False
-
-                state["error"] = "TWELVE_DATA_API_KEY is missing."
-
-            time.sleep(10)
-
+        with lock:
+            mode, symbol = state["mode"], state["symbol"]
+            key = OTCHARTS_KEY
+            otc_id = OTC_SYMBOLS.get(symbol)
+        if mode != "otc" or not key or not otc_id:
+            time.sleep(2)
             continue
-
+        url = "https://otcharts.com/v1/stream?" + urllib.parse.urlencode({"venue": "quotex", "symbol": otc_id})
         try:
-
-            def on_open(ws):
-
-                with state_lock:
-
-                    state["ws_connected"] = True
-
-                    state["error"] = None
-
-                subscribe(ws)
-
-            def on_message(ws, message):
-
-                try:
-
-                    data = json.loads(message)
-
-                except Exception:
-
-                    return
-
-                if data.get("event") != "price":
-
-                    return
-
-                symbol = data.get("symbol")
-
-                price_value = data.get("price")
-
-                timestamp = data.get("timestamp")
-
-                if symbol not in REAL_SYMBOLS:
-
-                    return
-
-                try:
-
-                    price = float(price_value)
-
-                except Exception:
-
-                    return
-
-                try:
-
-                    ts = float(timestamp)
-
-                except Exception:
-
-                    ts = time.time()
-
-                # Only update currently selected symbol
-
-                with state_lock:
-
-                    selected = state["symbol"]
-
-                if symbol != selected:
-
-                    return
-
-                update_live_candle(ts, price)
-
-            def on_error(ws, error):
-
-                with state_lock:
-
-                    state["ws_connected"] = False
-
-                    state["error"] = str(error)
-
-            def on_close(ws, close_status_code, close_msg):
-
-                with state_lock:
-
-                    state["ws_connected"] = False
-
-            ws = websocket.WebSocketApp(
-
-                websocket_url(),
-
-                on_open=on_open,
-
-                on_message=on_message,
-
-                on_error=on_error,
-
-                on_close=on_close,
-
-            )
-
-            ws.run_forever(
-
-                ping_interval=20,
-
-                ping_timeout=10
-
-            )
-
-        except Exception as e:
-
-            with state_lock:
-
-                state["ws_connected"] = False
-
-                state["error"] = str(e)
-
+            req = urllib.request.Request(url, headers={
+                "Authorization": "Bearer " + key,
+                "Accept": "text/event-stream",
+                "User-Agent": "FinorixPro/1.0",
+            })
+            with urllib.request.urlopen(req, timeout=35) as response:
+                with lock:
+                    state["otc_stream_connected"] = True
+                event_name = ""
+                for raw in response:
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        try:
+                            data = json.loads(line[5:].strip())
+                        except json.JSONDecodeError:
+                            continue
+                        if event_name == "tick" or ("price" in data and "symbol" in data):
+                            try:
+                                selected_tick_price(symbol, float(data["price"]), float(data.get("time", time.time())), "otc")
+                            except (ValueError, TypeError, KeyError):
+                                pass
+                    elif not line:
+                        event_name = ""
+        except Exception as exc:
+            with lock:
+                state["otc_stream_connected"] = False
+                # Keep a clear but nonfatal stream note; REST history can still work.
+                if state["mode"] == "otc":
+                    state["error"] = f"OTCharts stream unavailable; REST candles remain enabled ({exc})"
+        finally:
+            with lock:
+                state["otc_stream_connected"] = False
         time.sleep(5)
 
-# ============================================================
 
-# LOAD HISTORICAL DATA
-
-# ============================================================
-
-def load_symbol(symbol):
-
-    candles = fetch_history(symbol)
-
-    if not candles:
-
+def real_websocket_worker():
+    """Twelve Data websocket for real FX ticks, when key/plan supports it."""
+    try:
+        import websocket
+    except ImportError:
         return
+    while True:
+        if not TWELVE_KEY:
+            time.sleep(10)
+            continue
+        try:
+            url = "wss://ws.twelvedata.com/v1/quotes/price?apikey=" + urllib.parse.quote(TWELVE_KEY)
+            def on_open(ws):
+                with lock:
+                    state["real_ws_connected"] = True
+                ws.send(json.dumps({"action": "subscribe", "params": {"symbols": ",".join(REAL_SYMBOLS)}}))
+            def on_message(ws, message):
+                try:
+                    data = json.loads(message)
+                    if data.get("event") != "price":
+                        return
+                    symbol = data.get("symbol")
+                    if symbol not in REAL_SYMBOLS:
+                        return
+                    price = float(data["price"])
+                    ts = float(data.get("timestamp", time.time()))
+                    selected_tick_price(symbol, price, ts, "real")
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    return
+            def on_error(ws, error):
+                with lock:
+                    state["real_ws_connected"] = False
+            def on_close(ws, *args):
+                with lock:
+                    state["real_ws_connected"] = False
+            ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception:
+            with lock:
+                state["real_ws_connected"] = False
+        time.sleep(5)
 
-    now_ts = time.time()
-
-    current_start = minute_start(now_ts)
-
-    previous = None
-
-    current_seed = None
-
-    history = []
-
-    for candle in candles:
-
-        if candle["timestamp"] < current_start:
-
-            history.append(candle)
-
-            if (
-
-                previous is None or
-
-                candle["timestamp"] > previous["timestamp"]
-
-            ):
-
-                previous = candle
-
-        elif candle["timestamp"] == current_start:
-
-            current_seed = candle
-
-    # Keep historical candles
-
-    history = history[-150:]
-
-    with state_lock:
-
-        state["symbol"] = symbol
-
-        state["history"] = history
-
-        state["previous"] = previous
-
-        # If REST already has current candle,
-
-        # use it only as initial seed until live ticks arrive.
-
-        if current_seed:
-
-            state["current"] = current_seed.copy()
-
-            state["price"] = current_seed["close"]
-
-        else:
-
-            state["current"] = None
-
-            state["price"] = None
-
-        state["prediction"] = None
-
-# ============================================================
-
-# API
-
-# ============================================================
 
 def api_response():
-
-    with state_lock:
-
-        symbol = state["symbol"]
-
-        current = state["current"].copy() if state["current"] else None
-
-        previous = state["previous"].copy() if state["previous"] else None
-
-        price = state["price"]
-
-        connected = state["ws_connected"]
-
+    refresh_history(False)
+    with lock:
+        mode, symbol, interval = state["mode"], state["symbol"], state["interval"]
+        candles = [c.copy() for c in state["candles"]]
+        live_price = state["live_price"]
         last_tick = state["last_tick"]
-
         error = state["error"]
+        source = state["source"]
+        ws_connected = state["otc_stream_connected"] if mode == "otc" else state["real_ws_connected"]
+        last_refresh = state["last_refresh"]
 
-    prediction = analyze_current(symbol)
+    now = time.time()
+    frame = TIMEFRAMES[interval]
+    this_start = current_interval_start(now, interval)
+    # Merge a recent live price into the currently forming bar only.
+    if live_price is not None and last_tick is not None and now - last_tick < 120 and candles:
+        if candles[-1]["timestamp"] == this_start:
+            candles[-1]["high"] = max(candles[-1]["high"], live_price)
+            candles[-1]["low"] = min(candles[-1]["low"], live_price)
+            candles[-1]["close"] = live_price
 
-    now_ts = time.time()
-
-    if current:
-
-        candle_end = current["timestamp"] + 60
-
-        remaining = max(0, int(candle_end - now_ts))
-
-    else:
-
-        candle_end = None
-
-        remaining = None
+    # Exclude the current timeframe candle from prediction if present.
+    completed = [c for c in candles if c["timestamp"] + frame <= now]
+    prediction = predict_next_candle(completed)
+    current = next((c for c in reversed(candles) if c["timestamp"] == this_start), None)
+    if current is None and candles:
+        current = candles[-1] if candles[-1]["timestamp"] + frame > now else None
 
     return {
-
         "status": "ok",
-
-        "mode": "CURRENT-CANDLE LIVE",
-
+        "mode": "QUOTEX OTC" if mode == "otc" else "REAL FOREX",
+        "market": "OTC" if mode == "otc" else "REAL FOREX",
         "symbol": symbol,
-
-        "market": "REAL FOREX",
-
-        "time": {
-
-            "utc": format_time_utc(now_ts),
-
-            "utc6": format_time_utc6(now_ts),
-
-            "current_candle": (
-
-                format_time_utc6(current["timestamp"])
-
-                if current else "--"
-
-            ),
-
-            "candle_end": (
-
-                format_time_utc6(candle_end)
-
-                if candle_end else "--"
-
-            ),
-
-            "seconds_remaining": remaining,
-
-        },
-
-        "websocket": {
-
-            "connected": connected,
-
-            "last_tick": (
-
-                format_time_utc(last_tick)
-
-                if last_tick else "--"
-
-            ),
-
-        },
-
+        "interval": interval,
+        "timeframe_seconds": frame,
+        "source": source,
+        "candles": candles[-80:],
         "current_candle": current,
-
-        "previous_candle": previous,
-
-        "price": price,
-
+        "last_closed_timestamp": completed[-1]["timestamp"] if completed else None,
         "prediction": prediction,
-
+        "price": live_price if live_price is not None else (current["close"] if current else None),
+        "time": {
+            "utc": utc_string(now),
+            "utc6": local_string(now),
+            "current_candle": local_string(current["timestamp"]) if current else "--",
+            "seconds_remaining": max(0, int((this_start + frame) - now)),
+        },
+        "websocket": {"connected": bool(ws_connected), "last_tick": utc_string(last_tick)},
+        "last_refresh": last_refresh,
         "error": error,
-
+        "note": "Signal is for the candle after the last completed candle. Strength is not a calibrated win probability.",
     }
 
-# ============================================================
-
-# WEB PAGE
-
-# ============================================================
-
-HTML = r"""
-
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
-<title>FINORIX AI</title>
-
-<style>
-
-body {
-
-    margin: 0;
-
-    background: #07111f;
-
-    color: white;
-
-    font-family: Arial, sans-serif;
-
-}
-
-.container {
-
-    max-width: 650px;
-
-    margin: auto;
-
-    padding: 18px;
-
-}
-
-.card {
-
-    background: #0d1b2d;
-
-    border: 1px solid #20344e;
-
-    border-radius: 16px;
-
-    padding: 18px;
-
-    margin-bottom: 14px;
-
-}
-
-.title {
-
-    font-size: 28px;
-
-    font-weight: bold;
-
-}
-
-.mode {
-
-    margin-top: 7px;
-
-    color: #55d6ff;
-
-    font-weight: bold;
-
-}
-
-.row {
-
-    display: flex;
-
-    justify-content: space-between;
-
-    padding: 8px 0;
-
-    border-bottom: 1px solid #1b2d43;
-
-}
-
-.big {
-
-    font-size: 42px;
-
-    font-weight: bold;
-
-    text-align: center;
-
-    margin: 18px 0;
-
-}
-
-.up {
-
-    color: #39e58c;
-
-}
-
-.down {
-
-    color: #ff6577;
-
-}
-
-.wait {
-
-    color: #ffc857;
-
-}
-
-button, select {
-
-    width: 100%;
-
-    padding: 13px;
-
-    border-radius: 10px;
-
-    border: 0;
-
-    margin-top: 8px;
-
-    font-size: 16px;
-
-}
-
-button {
-
-    background: #1d8cff;
-
-    color: white;
-
-    font-weight: bold;
-
-}
-
-.status {
-
-    text-align: center;
-
-    margin-top: 10px;
-
-}
-
-.reason {
-
-    margin: 7px 0;
-
-    padding: 9px;
-
-    background: #102238;
-
-    border-radius: 8px;
-
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-    <div class="card">
-
-        <div class="title">FINORIX AI</div>
-
-        <div class="mode">MODE: CURRENT-CANDLE LIVE</div>
-
-        <div>REAL FOREX MARKET — NO OTC</div>
-
-        <select id="symbol">
-
-            <option>EUR/USD</option>
-
-            <option>GBP/USD</option>
-
-            <option>USD/JPY</option>
-
-            <option>AUD/USD</option>
-
-            <option>USD/CAD</option>
-
-            <option>USD/CHF</option>
-
-            <option>NZD/USD</option>
-
-            <option>EUR/GBP</option>
-
-        </select>
-
-        <button onclick="changeSymbol()">CHANGE MARKET</button>
-
-    </div>
-
-    <div class="card">
-
-        <div class="row">
-
-            <span>Market</span>
-
-            <b id="market">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Market Time UTC+6</span>
-
-            <b id="time">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Current Candle</span>
-
-            <b id="candle">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Time Remaining</span>
-
-            <b id="remaining">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Live Price</span>
-
-            <b id="price">--</b>
-
-        </div>
-
-        <div class="status" id="connection">Connecting...</div>
-
-    </div>
-
-    <div class="card">
-
-        <div style="text-align:center">
-
-            NEXT CANDLE PREDICTION
-
-        </div>
-
-        <div id="prediction" class="big wait">
-
-            WAIT
-
-        </div>
-
-        <div class="row">
-
-            <span>Confidence</span>
-
-            <b id="confidence">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Score</span>
-
-            <b id="score">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Action</span>
-
-            <b id="action">WAIT</b>
-
-        </div>
-
-    </div>
-
-    <div class="card">
-
-        <b>Current Candle</b>
-
-        <div class="row">
-
-            <span>Open</span>
-
-            <b id="open">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>High</span>
-
-            <b id="high">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Low</span>
-
-            <b id="low">--</b>
-
-        </div>
-
-        <div class="row">
-
-            <span>Close / Live Price</span>
-
-            <b id="close">--</b>
-
-        </div>
-
-    </div>
-
-    <div class="card">
-
-        <b>Analysis</b>
-
-        <div id="reasons"></div>
-
-    </div>
-
-</div>
-
-<script>
-
-async function loadData() {
-
-    try {
-
-        const response = await fetch("/api/candles");
-
-        const data = await response.json();
-
-        document.getElementById("market").innerText =
-
-            data.symbol + " — REAL FOREX";
-
-        document.getElementById("time").innerText =
-
-            data.time.utc6;
-
-        document.getElementById("candle").innerText =
-
-            data.time.current_candle;
-
-        document.getElementById("remaining").innerText =
-
-            data.time.seconds_remaining === null
-
-                ? "--"
-
-                : data.time.seconds_remaining + " sec";
-
-        document.getElementById("price").innerText =
-
-            data.price === null
-
-                ? "--"
-
-                : Number(data.price).toFixed(5);
-
-        const connected = data.websocket.connected;
-
-        document.getElementById("connection").innerText =
-
-            connected
-
-                ? "🟢 LIVE PRICE CONNECTED"
-
-                : "🔴 LIVE PRICE DISCONNECTED";
-
-        const p = data.prediction;
-
-        const prediction = document.getElementById("prediction");
-
-        prediction.innerText = p.direction;
-
-        prediction.className = "big " +
-
-            (
-
-                p.direction === "UP"
-
-                    ? "up"
-
-                    : p.direction === "DOWN"
-
-                        ? "down"
-
-                        : "wait"
-
-            );
-
-        document.getElementById("confidence").innerText =
-
-            p.confidence + "%";
-
-        document.getElementById("score").innerText =
-
-            p.score ?? "--";
-
-        document.getElementById("action").innerText =
-
-            p.action;
-
-        const c = data.current_candle;
-
-        if (c) {
-
-            document.getElementById("open").innerText =
-
-                Number(c.open).toFixed(5);
-
-            document.getElementById("high").innerText =
-
-                Number(c.high).toFixed(5);
-
-            document.getElementById("low").innerText =
-
-                Number(c.low).toFixed(5);
-
-            document.getElementById("close").innerText =
-
-                Number(c.close).toFixed(5);
-
-        }
-
-        const reasons =
-
-            document.getElementById("reasons");
-
-        reasons.innerHTML = "";
-
-        if (p.reasons) {
-
-            p.reasons.forEach(function(reason) {
-
-                const div = document.createElement("div");
-
-                div.className = "reason";
-
-                div.innerText = "• " + reason;
-
-                reasons.appendChild(div);
-
-            });
-
-        }
-
-        document.getElementById("symbol").value =
-
-            data.symbol;
-
-    }
-
-    catch (error) {
-
-        document.getElementById("connection").innerText =
-
-            "🔴 API ERROR";
-
-    }
-
-}
-
-async function changeSymbol() {
-
-    const symbol =
-
-        document.getElementById("symbol").value;
-
-    await fetch(
-
-        "/api/set-symbol?symbol=" +
-
-        encodeURIComponent(symbol)
-
-    );
-
-    loadData();
-
-}
-
-loadData();
-
-setInterval(loadData, 1000);
-
-</script>
-
-</body>
-
-</html>
-
-"""
-
-# ============================================================
-
-# HTTP SERVER
-
-# ============================================================
 
 class Handler(BaseHTTPRequestHandler):
-
-    def send_json(self, data):
-
-        body = json.dumps(
-
-            data,
-
-            ensure_ascii=False
-
-        ).encode("utf-8")
-
-        self.send_response(200)
-
-        self.send_header(
-
-            "Content-Type",
-
-            "application/json; charset=utf-8"
-
-        )
-
-        self.send_header(
-
-            "Content-Length",
-
-            str(len(body))
-
-        )
-
-        self.send_header(
-
-            "Cache-Control",
-
-            "no-store"
-
-        )
-
+    def send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-
         self.wfile.write(body)
 
     def do_GET(self):
-
-        parsed = urllib.parse.urlparse(
-
-            self.path
-
-        )
-
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
         path = parsed.path
 
-        query = urllib.parse.parse_qs(
-
-            parsed.query
-
-        )
-
         if path == "/":
-
-            body = HTML.encode("utf-8")
-
+            try:
+                body = (BASE_DIR / "index.html").read_bytes()
+            except OSError:
+                body = b"index.html not found"
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(200)
-
-            self.send_header(
-
-                "Content-Type",
-
-                "text/html; charset=utf-8"
-
-            )
-
-            self.send_header(
-
-                "Content-Length",
-
-                str(len(body))
-
-            )
-
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
-
             self.wfile.write(body)
-
             return
 
         if path == "/api/candles":
-
+            # Accept optional browser query parameters and apply them safely.
+            mode = query.get("mode", [None])[0]
+            symbol = query.get("symbol", [None])[0]
+            interval = query.get("interval", [None])[0]
+            changed = False
+            with lock:
+                if mode in ("otc", "real") and mode != state["mode"]:
+                    state["mode"] = mode
+                    state["symbol"] = ("EUR/USD (OTC)" if mode == "otc" else "EUR/USD")
+                    changed = True
+                if symbol:
+                    allowed = OTC_SYMBOLS if state["mode"] == "otc" else REAL_SYMBOLS
+                    if symbol in allowed and symbol != state["symbol"]:
+                        state["symbol"] = symbol
+                        changed = True
+                if interval in TIMEFRAMES and interval != state["interval"]:
+                    state["interval"] = interval
+                    changed = True
+                if changed:
+                    state["candles"] = []
+                    state["live_price"] = None
+                    state["last_tick"] = None
+                    state["last_refresh"] = 0
+                    state["error"] = None
+            if changed:
+                refresh_history(True)
             self.send_json(api_response())
-
             return
 
         if path == "/api/health":
-
-            with state_lock:
-
-                connected = state["ws_connected"]
-
-            self.send_json({
-
-                "status": "ok",
-
-                "mode": "CURRENT-CANDLE LIVE",
-
-                "websocket": connected
-
-            })
-
+            with lock:
+                data = {
+                    "status": "ok", "mode": state["mode"], "symbol": state["symbol"],
+                    "source": state["source"], "error": state["error"],
+                    "otc_stream_connected": state["otc_stream_connected"],
+                    "real_ws_connected": state["real_ws_connected"],
+                }
+            self.send_json(data)
             return
 
-        if path == "/api/set-symbol":
-
-            requested = query.get(
-
-                "symbol",
-
-                [DEFAULT_SYMBOL]
-
-            )[0]
-
-            if requested not in REAL_SYMBOLS:
-
-                self.send_json({
-
-                    "status": "error",
-
-                    "message": "Symbol not allowed."
-
-                })
-
+        if path == "/api/set-market":
+            mode = query.get("mode", ["real"])[0]
+            symbol = query.get("symbol", ["EUR/USD"])[0]
+            interval = query.get("interval", ["1min"])[0]
+            if mode not in ("otc", "real") or interval not in TIMEFRAMES:
+                self.send_json({"status": "error", "error": "Invalid market or timeframe."}, 400)
                 return
-
-            load_symbol(requested)
-
-            self.send_json({
-
-                "status": "ok",
-
-                "symbol": requested
-
-            })
-
+            allowed = OTC_SYMBOLS if mode == "otc" else REAL_SYMBOLS
+            if symbol not in allowed:
+                self.send_json({"status": "error", "error": "Symbol is not supported for this market."}, 400)
+                return
+            with lock:
+                state.update({"mode": mode, "symbol": symbol, "interval": interval,
+                              "candles": [], "live_price": None, "last_tick": None,
+                              "last_refresh": 0, "error": None})
+            refresh_history(True)
+            self.send_json({"status": "ok", "mode": mode, "symbol": symbol, "interval": interval})
             return
 
-        self.send_response(404)
+        self.send_json({"status": "error", "error": "Not found"}, 404)
 
-        self.end_headers()
+    def log_message(self, fmt, *args):
+        # Keep Render logs useful without noisy per-second request logging.
+        if self.path.startswith("/api/health"):
+            return
+        super().log_message(fmt, *args)
 
-# ============================================================
-
-# START
-
-# ============================================================
 
 def main():
-
-    if not API_KEY:
-
-        print(
-
-            "WARNING: TWELVE_DATA_API_KEY is not configured."
-
-        )
-
-    # Seed historical data
-
-    load_symbol(DEFAULT_SYMBOL)
-
-    # Start live WebSocket
-
-    thread = threading.Thread(
-
-        target=websocket_worker,
-
-        daemon=True
-
-    )
-
-    thread.start()
-
-    # Start web server
-
-    server = ThreadingHTTPServer(
-
-        (HOST, PORT),
-
-        Handler
-
-    )
-
-    print(
-
-        f"FINORIX AI running on port {PORT}"
-
-    )
-
-    print(
-
-        "MODE: CURRENT-CANDLE LIVE"
-
-    )
-
-    print(
-
-        "MARKET: REAL FOREX"
-
-    )
-
+    with lock:
+        mode, symbol, interval = state["mode"], state["symbol"], state["interval"]
+    try:
+        refresh_history(True)
+    except Exception:
+        pass
+    threading.Thread(target=otc_stream_worker, daemon=True).start()
+    threading.Thread(target=real_websocket_worker, daemon=True).start()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"FINORIX PRO running on port {PORT}; initial market={mode} symbol={symbol} timeframe={interval}")
+    print("Read-only market data. Signals are probabilistic and use completed candles.")
     server.serve_forever()
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     main()
